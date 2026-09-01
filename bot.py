@@ -46,8 +46,7 @@ from telegram.ext import (
 # ---------- ENV ----------
 load_dotenv()
 
-# TUMHARI DETAILS YAHAN HARDCODE KAR DI HAIN (Ab env file ki zaroorat nahi)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8872210815:AAGB1oqKN-z5QaTgOnMMZj8L6_VVRKZLgoQ")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8872210815:AAGB1oqKN-z5QaTgOnMMZj8L6_VVRKZLgoQ").strip()
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "7618187004,8846085944")  
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()]
 if not ADMIN_IDS:
@@ -55,9 +54,10 @@ if not ADMIN_IDS:
     if old_admin and old_admin.isdigit():
         ADMIN_IDS = [int(old_admin)]
     else:
-        raise ValueError("ADMIN_IDS or ADMIN_ID must be set with at least one admin ID")
+        raise ValueError("ADMIN_IDS or ADMIN_ID must be set")
 
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@seventyx79").strip()
+# FIX: Remove any hidden quotes from channel username
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@seventyx79").strip().replace('"', '').replace("'", "")
 PORT = int(os.getenv("PORT", "8080"))
 WORKSPACE_BASE = Path(os.getenv("WORKSPACE_BASE", "./workspaces"))
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", "10MB").replace("MB", "")) * 1024 * 1024
@@ -90,7 +90,6 @@ class UserManager:
         self.users = self.data.get("users", {})
         self.processes = self.data.get("processes", [])
         self.telemetry = self.data.get("telemetry", {})
-        self._running_processes = {}  # pid -> (proc, log_file, user_id)
 
     def save(self):
         self.data["users"] = self.users
@@ -210,7 +209,6 @@ class UserManager:
         self.processes.clear()
         self.save()
 
-    # Telemetry
     def inc_run(self, user_id: int):
         uid = str(user_id)
         if uid not in self.telemetry:
@@ -301,59 +299,43 @@ async def install_dependencies(user_id: int, dest_dir: Path) -> Tuple[bool, str]
     if req_file.exists():
         cmd = ["pip", "install", "--user", "-r", str(req_file)]
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(dest_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            *cmd, cwd=str(dest_dir), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
-        output = stdout.decode()
-        output_lines.append(f"pip install output:\n{output[:500]}...")
-        if proc.returncode != 0:
-            return False, f"Dependency installation failed: {output[:300]}"
+        output_lines.append(f"pip install output:\n{stdout.decode()[:500]}...")
+        if proc.returncode != 0: return False, f"Dependency installation failed"
     elif package_file.exists():
         cmd = ["npm", "install", "--production"]
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(dest_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            *cmd, cwd=str(dest_dir), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
-        output = stdout.decode()
-        output_lines.append(f"npm install output:\n{output[:500]}...")
-        if proc.returncode != 0:
-            return False, f"npm install failed: {output[:300]}"
+        output_lines.append(f"npm install output:\n{stdout.decode()[:500]}...")
+        if proc.returncode != 0: return False, f"npm install failed"
     else:
-        output_lines.append("No dependency file found; skipping installation.")
+        output_lines.append("No dependency file found; skipping.")
     return True, "\n".join(output_lines)
 
-# ---------- AUTO INSTALL MISSING MODULE ----------
 async def auto_install_module(module_name: str) -> bool:
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "pip", "install", "--user", module_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        _, _ = await proc.communicate()
+        await proc.communicate()
         return proc.returncode == 0
     except:
         return False
 
 def extract_module_name_from_error(error_text: str) -> Optional[str]:
     match = re.search(r"ModuleNotFoundError: No module named ['\"](.+?)['\"]", error_text)
-    if match:
-        return match.group(1)
+    if match: return match.group(1)
     match = re.search(r"ImportError: No module named ['\"](.+?)['\"]", error_text)
-    if match:
-        return match.group(1)
+    if match: return match.group(1)
     return None
 
-# ---------- AI DEBUGGER ----------
 async def get_ai_debug_suggestion(error_log: str) -> str:
-    if not OPENAI_API_KEY:
-        return "🔧 AI Debugger inactive (no OpenAI API key)."
+    if not OPENAI_API_KEY: return "🔧 AI Debugger inactive."
     try:
         import openai
         openai.api_key = OPENAI_API_KEY
@@ -370,102 +352,68 @@ async def get_ai_debug_suggestion(error_log: str) -> str:
     except Exception as e:
         return f"⚠️ AI Debugger error: {str(e)}"
 
-# ---------- NON-STUCK SCRIPT RUNNER ----------
 async def run_script_with_watchdog(user_id: int, script_path: Path, file_type: str, context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, str, str]:
-    """Run script with timeout, auto-kill, and auto-pip."""
     user_manager.inc_run(user_id)
     ws = ensure_workspace(user_id)
     log_dir = ws / "logs"
     log_dir.mkdir(exist_ok=True)
-    log_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{script_path.stem}.log"
-    log_path = log_dir / log_name
+    log_path = log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{script_path.stem}.log"
 
-    if file_type == "py":
-        cmd = [sys.executable, str(script_path)]
-    else:
-        cmd = ["node", str(script_path)]
-
-    # First attempt
+    cmd = [sys.executable, str(script_path)] if file_type == "py" else ["node", str(script_path)]
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(script_path.parent),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        *cmd, cwd=str(script_path.parent), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     try:
         stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=SCRIPT_TIMEOUT)
-        output = stdout_data.decode()
-        returncode = proc.returncode
+        output, returncode = stdout_data.decode(), proc.returncode
     except asyncio.TimeoutError:
         proc.terminate()
         await proc.wait()
-        output = f"⏰ Script exceeded {SCRIPT_TIMEOUT}s timeout and was terminated.\n"
-        returncode = -1
+        output, returncode = f"⏰ Script exceeded {SCRIPT_TIMEOUT}s timeout.\n", -1
 
     if returncode != 0:
         missing = extract_module_name_from_error(output)
         if missing:
             await context.bot.send_message(user_id, f"⚙️ Missing `{missing}`. Installing...")
-            installed = await auto_install_module(missing)
-            if installed:
+            if await auto_install_module(missing):
                 await context.bot.send_message(user_id, f"✅ Installed `{missing}`. Restarting...")
                 proc2 = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    cwd=str(script_path.parent),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
+                    *cmd, cwd=str(script_path.parent), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 )
                 try:
                     stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=SCRIPT_TIMEOUT)
-                    output2 = stdout2.decode()
-                    returncode2 = proc2.returncode
+                    output2, returncode2 = stdout2.decode(), proc2.returncode
                 except asyncio.TimeoutError:
                     proc2.terminate()
                     await proc2.wait()
-                    output2 = f"⏰ Script exceeded {SCRIPT_TIMEOUT}s timeout and was terminated.\n"
-                    returncode2 = -1
-                with open(log_path, "w") as f:
-                    f.write(f"[First attempt]\n{output}\n\n[After install]\n{output2}")
+                    output2, returncode2 = f"⏰ Timeout.\n", -1
+                with open(log_path, "w") as f: f.write(f"{output}\n\n[Restart]\n{output2}")
                 if returncode2 == 0:
                     user_manager.inc_success(user_id)
                     return (proc2.pid, str(log_path), "✅ Success after auto-install.")
-                else:
-                    user_manager.inc_fail(user_id)
-                    ai_suggestion = await get_ai_debug_suggestion(output2)
-                    return (proc2.pid, str(log_path), f"❌ Still failing after install.\n{ai_suggestion}")
-            else:
-                user_manager.inc_bad(user_id)
-                with open(log_path, "w") as f:
-                    f.write(output)
-                ai_suggestion = await get_ai_debug_suggestion(output)
-                return (proc.pid, str(log_path), f"❌ Failed to install `{missing}`.\n{ai_suggestion}")
-        else:
-            user_manager.inc_fail(user_id)
-            with open(log_path, "w") as f:
-                f.write(output)
-            ai_suggestion = await get_ai_debug_suggestion(output)
-            return (proc.pid, str(log_path), f"❌ Script crashed.\n{ai_suggestion}")
-    else:
-        user_manager.inc_success(user_id)
-        with open(log_path, "w") as f:
-            f.write(output)
-        return (proc.pid, str(log_path), "✅ Script executed successfully.")
+                user_manager.inc_fail(user_id)
+                return (proc2.pid, str(log_path), f"❌ Failing after install.\n{await get_ai_debug_suggestion(output2)}")
+            user_manager.inc_bad(user_id)
+            with open(log_path, "w") as f: f.write(output)
+            return (proc.pid, str(log_path), f"❌ Failed to install `{missing}`.\n{await get_ai_debug_suggestion(output)}")
+        user_manager.inc_fail(user_id)
+        with open(log_path, "w") as f: f.write(output)
+        return (proc.pid, str(log_path), f"❌ Script crashed.\n{await get_ai_debug_suggestion(output)}")
+    
+    user_manager.inc_success(user_id)
+    with open(log_path, "w") as f: f.write(output)
+    return (proc.pid, str(log_path), "✅ Script executed successfully.")
 
 # ---------- TELEGRAM BOT HANDLERS ----------
 (UPLOAD_WAIT, TERMINAL_SESSION) = range(2)
 
 def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("💻 Terminal", callback_data="terminal"),
-         InlineKeyboardButton("📁 Upload", callback_data="upload")],
-        [InlineKeyboardButton("📂 My Scripts", callback_data="my_scripts"),
-         InlineKeyboardButton("📝 View Logs", callback_data="logs")],
+        [InlineKeyboardButton("💻 Terminal", callback_data="terminal"), InlineKeyboardButton("📁 Upload", callback_data="upload")],
+        [InlineKeyboardButton("📂 My Scripts", callback_data="my_scripts"), InlineKeyboardButton("📝 View Logs", callback_data="logs")],
         [InlineKeyboardButton("🛑 Stop Script", callback_data="stop")],
     ]
-    if user_id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+    if user_id in ADMIN_IDS: keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
 # ----- START / JOIN -----
@@ -478,7 +426,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if CHANNEL_USERNAME:
         try:
             member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
-            if member.status in ("left", "kicked"):
+            if member.status in (constants.ChatMemberStatus.LEFT, constants.ChatMemberStatus.BANNED):
                 await update.message.reply_text(
                     f"🔒 *Join {CHANNEL_USERNAME} to use this bot*",
                     parse_mode="Markdown",
@@ -488,29 +436,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ])
                 )
                 return
-        except Exception:
-            await update.message.reply_text("⚠️ Could not verify channel. Try again later.")
+        except Exception as e:
+            # FIX: Yahan ab EXACT error print hoga taake pata chale kya masla hai
+            error_msg = str(e)
+            await update.message.reply_text(f"⚠️ *Channel Verification Failed!*\n\n**Error:** `{error_msg}`\n\nPlease check if bot is admin in {CHANNEL_USERNAME}", parse_mode="Markdown")
             return
 
     u = user_manager.get_user(user_id)
     if not u:
         user_manager.add_user(user_id, fullname, username)
-        admin_msg = (
-            f"🔔 *New Access Request*\n"
-            f"👤 {fullname}\n"
-            f"🆔 `{user_id}`\n"
-            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        admin_msg = f"🔔 *New Request*\n👤 {fullname}\n🆔 `{user_id}`\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         for admin_id in ADMIN_IDS:
-            await context.bot.send_message(
-                admin_id,
-                admin_msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"),
-                     InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{user_id}")]
-                ])
-            )
+            try:
+                await context.bot.send_message(admin_id, admin_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"), InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{user_id}")]]))
+            except: pass
         await update.message.reply_text("✅ *Request sent to admin.*", parse_mode="Markdown")
         return
 
@@ -521,11 +460,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ *Your request is pending.*", parse_mode="Markdown")
         return
 
-    await update.message.reply_text(
-        f"👋 *Welcome {fullname}!*\nSelect an option:",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(user_id)
-    )
+    await update.message.reply_text(f"👋 *Welcome {fullname}!*\nSelect an option:", parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
 
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -534,137 +469,79 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if CHANNEL_USERNAME:
         try:
             member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
-            if member.status in ("left", "kicked"):
+            if member.status in (constants.ChatMemberStatus.LEFT, constants.ChatMemberStatus.BANNED):
                 await query.edit_message_text(
                     "❌ Still not joined.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📢 Channel", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
-                        [InlineKeyboardButton("✅ I Joined — Check", callback_data="check_join")]
-                    ])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Channel", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")], [InlineKeyboardButton("✅ I Joined — Check", callback_data="check_join")]])
                 )
                 return
-        except Exception:
-            await query.edit_message_text("⚠️ Error checking membership.")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ **Error:** `{str(e)}`", parse_mode="Markdown")
             return
     user = query.from_user
-    fullname = user.full_name
-    username = user.username or "No username"
     u = user_manager.get_user(user_id)
     if not u:
-        user_manager.add_user(user_id, fullname, username)
-        admin_msg = (
-            f"🔔 *New Access Request*\n"
-            f"👤 {fullname}\n"
-            f"🆔 `{user_id}`\n"
-            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        user_manager.add_user(user_id, user.full_name, user.username or "No username")
         for admin_id in ADMIN_IDS:
-            await context.bot.send_message(
-                admin_id,
-                admin_msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"),
-                     InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{user_id}")]
-                ])
-            )
+            try:
+                await context.bot.send_message(admin_id, f"🔔 *New Request*\n👤 {user.full_name}\n🆔 `{user_id}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"), InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{user_id}")]]))
+            except: pass
         await query.edit_message_text("✅ Request sent.")
         return
-    if user_manager.is_banned(user_id):
-        await query.edit_message_text("🚫 Banned.")
-        return
-    if user_manager.is_pending(user_id):
-        await query.edit_message_text("⏳ Pending.")
-        return
-    await query.edit_message_text(
-        f"👋 *Welcome {fullname}!*",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(user_id)
-    )
+    if user_manager.is_banned(user_id): return await query.edit_message_text("🚫 Banned.")
+    if user_manager.is_pending(user_id): return await query.edit_message_text("⏳ Pending.")
+    await query.edit_message_text(f"👋 *Welcome {user.full_name}!*", parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
 
 # ----- MAIN MENU -----
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    if not user_manager.is_approved(user_id):
-        await query.edit_message_text("❌ Not approved.")
-        return
-    await query.edit_message_text(
-        "📋 *Main Menu*",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(user_id)
-    )
+    if not user_manager.is_approved(query.from_user.id): return await query.edit_message_text("❌ Not approved.")
+    await query.edit_message_text("📋 *Main Menu*", parse_mode="Markdown", reply_markup=get_main_keyboard(query.from_user.id))
 
 # ----- UPLOAD -----
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    if not user_manager.is_approved(user_id):
-        await query.edit_message_text("❌ Not approved.")
-        return
-    await query.edit_message_text(
-        "📤 *Send a file* (`.py`, `.js`, or `.zip`)\n"
-        "ZIP will be extracted.",
-        parse_mode="Markdown"
-    )
+    if not user_manager.is_approved(query.from_user.id): return await query.edit_message_text("❌ Not approved.")
+    await query.edit_message_text("📤 *Send a file* (`.py`, `.js`, or `.zip`)", parse_mode="Markdown")
     return UPLOAD_WAIT
 
 async def upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("❌ Please send a file.")
-        return UPLOAD_WAIT
-
+    user_id, document = update.effective_user.id, update.message.document
+    if not document: return UPLOAD_WAIT
     filename = document.file_name
     if not any(filename.endswith(ext) for ext in [".py", ".js", ".zip"]):
         await update.message.reply_text("❌ Only `.py`, `.js`, `.zip` allowed.")
         return ConversationHandler.END
-
     if document.file_size > MAX_UPLOAD_SIZE:
-        await update.message.reply_text(f"❌ File too large (max {MAX_UPLOAD_SIZE//1024//1024}MB)")
+        await update.message.reply_text("❌ File too large.")
         return ConversationHandler.END
-
+    
     ws = ensure_workspace(user_id)
-    safe_name = sanitize_filename(filename)
-    file_path = ws / safe_name
-
+    file_path = ws / sanitize_filename(filename)
     try:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(file_path)
     except Exception as e:
-        await update.message.reply_text(f"❌ Download failed: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {e}")
         return ConversationHandler.END
 
     if filename.endswith(".zip"):
-        extract_dir = ws / "extracted"
-        extract_dir.mkdir(exist_ok=True)
-        success, msg = extract_zip(user_id, file_path, extract_dir)
+        ext_dir = ws / "extracted"
+        ext_dir.mkdir(exist_ok=True)
+        success, msg = extract_zip(user_id, file_path, ext_dir)
         if not success:
-            await update.message.reply_text(f"❌ Extraction failed: {msg}")
+            await update.message.reply_text(f"❌ {msg}")
             return ConversationHandler.END
-        file_type, entry = detect_entry_point(extract_dir)
+        file_type, entry = detect_entry_point(ext_dir)
         if not entry:
-            await update.message.reply_text("❌ No `main.py` or `index.js` found.")
+            await update.message.reply_text("❌ No main.py/index.js found.")
             return ConversationHandler.END
-        dep_ok, dep_msg = await install_dependencies(user_id, extract_dir)
-        if not dep_ok:
-            await update.message.reply_text(f"❌ Dependency install failed:\n{dep_msg}")
-            return ConversationHandler.END
-        await update.message.reply_text(
-            f"✅ Archive extracted and dependencies installed.\n"
-            f"📄 Entry: `{Path(entry).name}`\n"
-            "▶️ Use *My Scripts* to run.",
-            parse_mode="Markdown"
-        )
+        dep_ok, dep_msg = await install_dependencies(user_id, ext_dir)
+        await update.message.reply_text(f"✅ Extracted. Entry: `{Path(entry).name}`", parse_mode="Markdown")
     else:
-        await update.message.reply_text(
-            f"✅ `{safe_name}` uploaded.\n"
-            "▶️ Use *My Scripts* to run.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"✅ `{file_path.name}` uploaded.", parse_mode="Markdown")
     return ConversationHandler.END
 
 async def upload_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,123 +554,55 @@ ALLOWED_COMMANDS = {"pwd", "ls", "cd", "cat", "head", "tail", "mkdir", "cp", "mv
 async def terminal_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    if not user_manager.is_approved(user_id):
-        await query.edit_message_text("❌ Not approved.")
-        return
-    ws = ensure_workspace(user_id)
+    if not user_manager.is_approved(query.from_user.id): return await query.edit_message_text("❌ Not approved.")
+    ws = ensure_workspace(query.from_user.id)
     context.user_data["terminal_cwd"] = str(ws)
-    await query.edit_message_text(
-        f"💻 *Terminal*\n`{ws}`\n\n"
-        "Allowed: `pwd, ls, cd, cat, head, tail, mkdir, cp, mv, rm`\n"
-        "Send `/cancel` to exit.",
-        parse_mode="Markdown"
-    )
+    await query.edit_message_text(f"💻 *Terminal*\n`{ws}`\nSend `/cancel` to exit.", parse_mode="Markdown")
     return TERMINAL_SESSION
 
 async def terminal_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("Please enter a command.")
-        return TERMINAL_SESSION
-
     if text.lower() == "/cancel":
         await update.message.reply_text("Terminal ended.")
         return ConversationHandler.END
-
     parts = shlex.split(text)
     cmd = parts[0].lower()
     if cmd not in ALLOWED_COMMANDS:
-        await update.message.reply_text(f"❌ Command `{cmd}` not allowed.")
+        await update.message.reply_text(f"❌ Command not allowed.")
         return TERMINAL_SESSION
-
-    cwd_str = context.user_data.get("terminal_cwd", str(ensure_workspace(user_id)))
-    cwd = Path(cwd_str)
-
-    if cmd == "cd":
-        if len(parts) < 2:
-            await update.message.reply_text("Usage: cd <dir>")
-            return TERMINAL_SESSION
-        target = Path(parts[1])
-        if not target.is_absolute():
-            target = cwd / target
-        try:
-            target = target.resolve()
-            if not is_safe_path(user_id, target):
-                await update.message.reply_text("❌ Cannot cd outside workspace.")
-                return TERMINAL_SESSION
-            if not target.is_dir():
-                await update.message.reply_text(f"❌ `{target}` is not a directory.", parse_mode="Markdown")
-                return TERMINAL_SESSION
+    
+    cwd = Path(context.user_data.get("terminal_cwd", str(ensure_workspace(update.effective_user.id))))
+    if cmd == "cd" and len(parts) > 1:
+        target = (cwd / parts[1]).resolve()
+        if is_safe_path(update.effective_user.id, target) and target.is_dir():
             context.user_data["terminal_cwd"] = str(target)
-            await update.message.reply_text(f"📁 Changed to: `{target}`", parse_mode="Markdown")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"📁 `{target}`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Invalid path.")
         return TERMINAL_SESSION
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *parts,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        output = stdout.decode() + stderr.decode()
-        if not output.strip():
-            output = "(no output)"
-        if len(output) > 4000:
-            output = output[:4000] + "\n... (truncated)"
-        await update.message.reply_text(f"```\n{output}\n```", parse_mode="Markdown")
-    except asyncio.TimeoutError:
-        proc.terminate()
-        await update.message.reply_text("❌ Command timed out.")
+        proc = await asyncio.create_subprocess_exec(*parts, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        out = (stdout.decode() + stderr.decode())[:4000] or "(no output)"
+        await update.message.reply_text(f"```\n{out}\n```", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {e}")
     return TERMINAL_SESSION
 
 async def terminal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Terminal cancelled.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ----- MY SCRIPTS WITH RUN -----
+# ----- SCRIPTS & RUN -----
 async def my_scripts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    ws = ensure_workspace(user_id)
-    files = list(ws.glob("*.py")) + list(ws.glob("*.js")) + list(ws.glob("extracted/*.py")) + list(ws.glob("extracted/*.js"))
-    if not files:
-        await query.edit_message_text("📂 *No scripts found.*\nUpload one using 📁 Upload.", parse_mode="Markdown")
-        return
-    keyboard = []
-    for f in files:
-        keyboard.append([
-            InlineKeyboardButton(f"📄 {f.name}", callback_data=f"view_script_{f}"),
-            InlineKeyboardButton("▶️ Run", callback_data=f"run_script_{f}")
-        ])
-    keyboard.append([InlineKeyboardButton("📊 My Stats", callback_data="my_stats")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    await query.edit_message_text(
-        "📂 *Your Scripts*\nClick a file to view or run.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    tele = user_manager.get_user_telemetry(user_id)
-    text = (
-        f"📊 *Your Telemetry*\n"
-        f"🚀 Total Runs: {tele['runs']}\n"
-        f"✅ Success: {tele['success']}\n"
-        f"❌ Fail: {tele['fail']}\n"
-        f"💀 Bad (critical): {tele['bad']}"
-    )
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my_scripts")]]))
+    files = list(ensure_workspace(query.from_user.id).glob("**/*.py")) + list(ensure_workspace(query.from_user.id).glob("**/*.js"))
+    if not files: return await query.edit_message_text("📂 *No scripts.*", parse_mode="Markdown")
+    kb = [[InlineKeyboardButton(f"📄 {f.name}", callback_data=f"view_script_{f}"), InlineKeyboardButton("▶️ Run", callback_data=f"run_script_{f}")] for f in files]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    await query.edit_message_text("📂 *Your Scripts*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def view_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -801,447 +610,144 @@ async def view_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = query.data.replace("view_script_", "", 1)
     try:
         with open(file_path, "r") as f:
-            content = f.read(500)
-            if len(content) >= 500:
-                content += "\n... (truncated)"
-            await query.edit_message_text(
-                f"📄 *File:* `{Path(file_path).name}`\n\n```\n{content}\n```",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("▶️ Run", callback_data=f"run_script_{file_path}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="my_scripts")]
-                ])
-            )
+            await query.edit_message_text(f"📄 `{Path(file_path).name}`\n```\n{f.read(500)}\n```", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Run", callback_data=f"run_script_{file_path}")], [InlineKeyboardButton("🔙 Back", callback_data="my_scripts")]]))
     except Exception as e:
-        await query.edit_message_text(f"❌ Error: {str(e)}")
+        await query.edit_message_text(f"❌ Error: {e}")
 
 async def run_script_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    file_path = query.data.replace("run_script_", "", 1)
-    script_path = Path(file_path)
-    if not script_path.exists():
-        await query.edit_message_text("❌ File not found.")
-        return
-    if script_path.suffix == ".py":
-        file_type = "py"
-    elif script_path.suffix == ".js":
-        file_type = "js"
-    else:
-        await query.edit_message_text("❌ Unsupported file type.")
-        return
+    script_path = Path(query.data.replace("run_script_", "", 1))
+    if not script_path.exists(): return await query.edit_message_text("❌ File not found.")
+    
+    for p in [p for p in user_manager.get_user_processes(user_id) if p["status"] == "running"]:
+        user_manager.stop_process(p["pid"])
+    
+    await query.edit_message_text("⏳ *Starting...*", parse_mode="Markdown")
+    pid, log_path, msg = await run_script_with_watchdog(user_id, script_path, "py" if script_path.suffix == ".py" else "js", context)
+    if pid: user_manager.add_process(user_id, script_path.name, pid, log_path)
+    await query.edit_message_text(f"{msg}\n📄 `{Path(log_path).name}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="my_scripts")]]))
 
-    # Auto-kill old running processes for this user
-    procs = user_manager.get_user_processes(user_id)
-    running = [p for p in procs if p["status"] == "running"]
-    if running:
-        for p in running:
-            user_manager.stop_process(p["pid"])
-        await context.bot.send_message(user_id, "⚡ Terminated old process. Starting new...")
-
-    await query.edit_message_text("⏳ *Starting script...*", parse_mode="Markdown")
-    pid, log_path, status_msg = await run_script_with_watchdog(user_id, script_path, file_type, context)
-    if pid:
-        user_manager.add_process(user_id, script_path.name, pid, log_path)
-    await query.edit_message_text(
-        f"{status_msg}\n📄 Log: `{Path(log_path).name}`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 View Log", callback_data=f"view_log_{log_path}")],
-            [InlineKeyboardButton("🔙 Back", callback_data="my_scripts")]
-        ])
-    )
-
-async def view_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    log_path = query.data.replace("view_log_", "", 1)
-    try:
-        with open(log_path, "r") as f:
-            content = f.read(3000)
-            if len(content) >= 3000:
-                content += "\n... (truncated)"
-            await query.edit_message_text(
-                f"📝 *Log: `{Path(log_path).name}`*\n\n```\n{content}\n```",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="my_scripts")]
-                ])
-            )
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {str(e)}")
-
-# ----- VIEW LOGS (list) -----
 async def view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    procs = user_manager.get_user_processes(user_id)
-    if not procs:
-        await query.edit_message_text("📝 No logs available.")
-        return
-    keyboard = []
-    for p in procs:
-        log_path = Path(p.get("log_path", ""))
-        if log_path.exists():
-            keyboard.append([
-                InlineKeyboardButton(f"📄 {log_path.name}", callback_data=f"view_log_{log_path}")
-            ])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    await query.edit_message_text(
-        "📝 *Your Logs*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    procs = user_manager.get_user_processes(query.from_user.id)
+    kb = [[InlineKeyboardButton(f"📄 {Path(p['log_path']).name}", callback_data=f"view_log_{p['log_path']}")] for p in procs if Path(p.get("log_path", "")).exists()]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    await query.edit_message_text("📝 *Logs*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-# ----- STOP SCRIPT -----
 async def stop_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    procs = user_manager.get_user_processes(user_id)
-    running = [p for p in procs if p["status"] == "running"]
-    if not running:
-        await query.edit_message_text("🛑 *No running processes.*", parse_mode="Markdown")
-        return
-    keyboard = []
-    for p in running:
-        keyboard.append([InlineKeyboardButton(
-            f"Stop {p['filename']} (PID {p['pid']})",
-            callback_data=f"stop_proc_{p['pid']}"
-        )])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    await query.edit_message_text(
-        "Select a process to stop:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    running = [p for p in user_manager.get_user_processes(query.from_user.id) if p["status"] == "running"]
+    if not running: return await query.edit_message_text("🛑 *No running processes.*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
+    kb = [[InlineKeyboardButton(f"Stop {p['filename']}", callback_data=f"stop_proc_{p['pid']}")] for p in running]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    await query.edit_message_text("Select to stop:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def stop_proc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    pid = int(query.data.split("_")[2])
-    proc = next((p for p in user_manager.get_user_processes(user_id) if p["pid"] == pid), None)
-    if not proc:
-        await query.edit_message_text("❌ Process not found.")
-        return
-    if user_manager.stop_process(pid):
-        await query.edit_message_text(f"✅ Process {pid} stopped.")
+    if user_manager.stop_process(int(query.data.split("_")[2])):
+        await query.edit_message_text("✅ Stopped.")
     else:
-        await query.edit_message_text("❌ Failed to stop.")
+        await query.edit_message_text("❌ Failed.")
 
-# ----- ADMIN PANEL (ADVANCED) -----
+# ----- ADMIN PANEL -----
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    keyboard = [
-        [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
-         InlineKeyboardButton("⏳ Pending", callback_data="admin_pending")],
-        [InlineKeyboardButton("🖥️ Running", callback_data="admin_running"),
-         InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton("🚫 Banned", callback_data="admin_banned")],
-        [InlineKeyboardButton("📈 Telemetry", callback_data="admin_telemetry")],
-        [InlineKeyboardButton("🧹 Cleanup", callback_data="admin_cleanup")],
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
+    if query.from_user.id not in ADMIN_IDS: return await query.edit_message_text("❌ Not admin.")
+    kb = [
+        [InlineKeyboardButton("⏳ Pending", callback_data="admin_pending"), InlineKeyboardButton("👥 Users", callback_data="admin_users")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
     ]
-    await query.edit_message_text(
-        "👑 *Admin Panel*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    users = user_manager.get_approved_users()
-    if not users:
-        await query.edit_message_text("No approved users.")
-        return
-    text = "👥 *Approved Users*\n\n"
-    for u in users:
-        tele = user_manager.get_user_telemetry(int(u['user_id']))
-        text += f"• {u['name']} (@{u['username']}) – `{u['user_id']}`\n"
-        text += f"  Runs: {tele['runs']} | ✅{tele['success']} ❌{tele['fail']} 💀{tele['bad']}\n"
-    await query.edit_message_text(text, parse_mode="Markdown")
+    await query.edit_message_text("👑 *Admin*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    pendings = user_manager.get_pending_requests()
-    if not pendings:
-        await query.edit_message_text("No pending requests.")
-        return
-    keyboard = []
-    for req in pendings:
-        uid = req['user_id']
-        keyboard.append([InlineKeyboardButton(
-            f"{req['name']} (@{req['username']})",
-            callback_data=f"pending_{uid}"
-        )])
-    await query.edit_message_text(
-        "⏳ *Pending Requests*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    kb = [[InlineKeyboardButton(f"{r['name']}", callback_data=f"pending_{r['user_id']}")] for r in user_manager.get_pending_requests()]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+    await query.edit_message_text("⏳ *Pending*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def pending_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
     uid = int(query.data.split("_")[1])
-    user = user_manager.get_user(uid)
-    if not user:
-        await query.edit_message_text("User not found.")
-        return
-    keyboard = [
-        [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-         InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{uid}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="admin_pending")]
-    ]
-    await query.edit_message_text(
-        f"👤 *{user['name']}* (@{user['username']})\n🆔 `{uid}`\n📅 {user['request_time']}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"), InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{uid}")], [InlineKeyboardButton("🔙 Back", callback_data="admin_pending")]]
+    await query.edit_message_text(f"Action for `{uid}`:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def approve_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
     uid = int(query.data.split("_")[1])
-    if user_manager.approve_user(uid):
-        await query.edit_message_text(f"✅ User `{uid}` approved.")
-        try:
-            await context.bot.send_message(uid, "✅ *Access approved!* Use /start.", parse_mode="Markdown")
-        except:
-            pass
-    else:
-        await query.edit_message_text("❌ Failed to approve.")
+    user_manager.approve_user(uid)
+    await query.edit_message_text(f"✅ Approved `{uid}`")
+    try: await context.bot.send_message(uid, "✅ *Approved!* Use /start.", parse_mode="Markdown")
+    except: pass
 
 async def ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
     uid = int(query.data.split("_")[1])
-    if user_manager.ban_user(uid):
-        await query.edit_message_text(f"🚫 User `{uid}` banned.")
-        try:
-            await context.bot.send_message(uid, "🚫 *You have been banned.*", parse_mode="Markdown")
-        except:
-            pass
-    else:
-        await query.edit_message_text("❌ Failed to ban.")
+    user_manager.ban_user(uid)
+    await query.edit_message_text(f"🚫 Banned `{uid}`")
 
-async def admin_running(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    procs = user_manager.get_all_processes()
-    running = [p for p in procs if p["status"] == "running"]
-    if not running:
-        await query.edit_message_text("No running processes.")
-        return
-    text = "🖥️ *Running Scripts*\n\n"
-    for p in running:
-        text += f"• {p['filename']} (PID {p['pid']}) – User `{p['user_id']}`\n"
-    await query.edit_message_text(text, parse_mode="Markdown")
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    total = len(user_manager.users)
-    approved = len(user_manager.get_approved_users())
-    pending = len(user_manager.get_pending_requests())
-    banned = len(user_manager.get_banned_users())
-    running = len([p for p in user_manager.get_all_processes() if p["status"] == "running"])
-    text = (
-        f"📊 *Statistics*\n"
-        f"👥 Total: {total}\n"
-        f"✅ Approved: {approved}\n"
-        f"⏳ Pending: {pending}\n"
-        f"🚫 Banned: {banned}\n"
-        f"🖥️ Running: {running}"
-    )
-    await query.edit_message_text(text, parse_mode="Markdown")
-
-async def admin_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    banned = user_manager.get_banned_users()
-    if not banned:
-        await query.edit_message_text("No banned users.")
-        return
-    keyboard = []
-    for u in banned:
-        uid = u['user_id']
-        keyboard.append([InlineKeyboardButton(f"Unban {u['name']}", callback_data=f"unban_{uid}")])
-    await query.edit_message_text(
-        "🚫 *Banned Users*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def unban_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    uid = int(query.data.split("_")[1])
-    if user_manager.unban_user(uid):
-        await query.edit_message_text(f"✅ User `{uid}` unbanned.")
-    else:
-        await query.edit_message_text("❌ Failed to unban.")
-
-async def admin_telemetry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    tele = user_manager.telemetry
-    if not tele:
-        await query.edit_message_text("No telemetry data yet.")
-        return
-    text = "📈 *Global Telemetry*\n\n"
-    total_runs = sum(t["runs"] for t in tele.values())
-    total_success = sum(t["success"] for t in tele.values())
-    total_fail = sum(t["fail"] for t in tele.values())
-    total_bad = sum(t["bad"] for t in tele.values())
-    text += f"Total Runs: {total_runs}\n✅ Success: {total_success}\n❌ Fail: {total_fail}\n💀 Bad: {total_bad}"
-    await query.edit_message_text(text, parse_mode="Markdown")
-
-async def admin_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("❌ Not admin.")
-        return
-    # Clean logs older than 7 days
-    seven_days_ago = datetime.now() - timedelta(days=7)
-    for user_id in user_manager.users:
-        ws = user_manager.get_workspace(int(user_id))
-        log_dir = ws / "logs"
-        if log_dir.exists():
-            for log_file in log_dir.glob("*.log"):
-                if datetime.fromtimestamp(log_file.stat().st_mtime) < seven_days_ago:
-                    log_file.unlink()
-    await query.edit_message_text("🧹 Cleanup completed. Old logs removed.")
-
-# ---------- ERROR HANDLER ----------
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Update {update} caused error {context.error}")
-    try:
-        await update.message.reply_text("⚠️ Internal error. Try again.")
-    except:
-        pass
-
-# ---------- FLASK HEALTH ----------
+# ----- FLASK & MAIN -----
 flask_app = Flask(__name__)
-
 @flask_app.route('/')
-@flask_app.route('/api/')
 @flask_app.route('/api/healthz')
-def health():
-    return jsonify({"status": "ok", "service": "telegram-bot"})
+def health(): return jsonify({"status": "ok"})
+def run_flask(): flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-
-# ---------- POST INIT (For background tasks) ----------
 async def post_init(application: Application):
-    # Auto-cleanup every 24 hours fixed here to avoid 'no event loop' RuntimeError
     async def scheduled_cleanup():
         while True:
             await asyncio.sleep(86400)
-            seven_days_ago = datetime.now() - timedelta(days=7)
-            for user_id in user_manager.users:
-                ws = user_manager.get_workspace(int(user_id))
-                log_dir = ws / "logs"
+            for uid in user_manager.users:
+                log_dir = user_manager.get_workspace(int(uid)) / "logs"
                 if log_dir.exists():
-                    for log_file in log_dir.glob("*.log"):
-                        if datetime.fromtimestamp(log_file.stat().st_mtime) < seven_days_ago:
-                            try:
-                                log_file.unlink()
-                            except:
-                                pass
+                    for f in log_dir.glob("*.log"):
+                        if datetime.fromtimestamp(f.stat().st_mtime) < datetime.now() - timedelta(days=7):
+                            try: f.unlink()
+                            except: pass
     asyncio.create_task(scheduled_cleanup())
 
-# ---------- MAIN ----------
 def main():
     Thread(target=run_flask, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(check_join, pattern="^check_join$"))
+    app.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(upload_start, pattern="^upload$"))
+    app.add_handler(CallbackQueryHandler(terminal_start, pattern="^terminal$"))
+    app.add_handler(CallbackQueryHandler(my_scripts, pattern="^my_scripts$"))
+    app.add_handler(CallbackQueryHandler(view_script, pattern="^view_script_"))
+    app.add_handler(CallbackQueryHandler(run_script_callback, pattern="^run_script_"))
+    app.add_handler(CallbackQueryHandler(view_logs, pattern="^logs$"))
+    app.add_handler(CallbackQueryHandler(stop_script, pattern="^stop$"))
+    app.add_handler(CallbackQueryHandler(stop_proc_callback, pattern="^stop_proc_"))
+    app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
+    app.add_handler(CallbackQueryHandler(admin_pending, pattern="^admin_pending$"))
+    app.add_handler(CallbackQueryHandler(pending_action, pattern="^pending_"))
+    app.add_handler(CallbackQueryHandler(approve_user_callback, pattern="^approve_"))
+    app.add_handler(CallbackQueryHandler(ban_user_callback, pattern="^ban_"))
 
-    # Pass post_init to builder for proper event loop binding
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(check_join, pattern="^check_join$"))
-    application.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(upload_start, pattern="^upload$"))
-    application.add_handler(CallbackQueryHandler(terminal_start, pattern="^terminal$"))
-    application.add_handler(CallbackQueryHandler(my_scripts, pattern="^my_scripts$"))
-    application.add_handler(CallbackQueryHandler(my_stats, pattern="^my_stats$"))
-    application.add_handler(CallbackQueryHandler(view_script, pattern="^view_script_"))
-    application.add_handler(CallbackQueryHandler(run_script_callback, pattern="^run_script_"))
-    application.add_handler(CallbackQueryHandler(view_log, pattern="^view_log_"))
-    application.add_handler(CallbackQueryHandler(view_logs, pattern="^logs$"))
-    application.add_handler(CallbackQueryHandler(stop_script, pattern="^stop$"))
-    application.add_handler(CallbackQueryHandler(stop_proc_callback, pattern="^stop_proc_"))
-    application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
-    application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
-    application.add_handler(CallbackQueryHandler(admin_pending, pattern="^admin_pending$"))
-    application.add_handler(CallbackQueryHandler(pending_action, pattern="^pending_"))
-    application.add_handler(CallbackQueryHandler(approve_user_callback, pattern="^approve_"))
-    application.add_handler(CallbackQueryHandler(ban_user_callback, pattern="^ban_"))
-    application.add_handler(CallbackQueryHandler(admin_running, pattern="^admin_running$"))
-    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    application.add_handler(CallbackQueryHandler(admin_banned, pattern="^admin_banned$"))
-    application.add_handler(CallbackQueryHandler(unban_callback, pattern="^unban_"))
-    application.add_handler(CallbackQueryHandler(admin_telemetry, pattern="^admin_telemetry$"))
-    application.add_handler(CallbackQueryHandler(admin_cleanup, pattern="^admin_cleanup$"))
-
-    upload_conv = ConversationHandler(
+    app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(upload_start, pattern="^upload$")],
         states={UPLOAD_WAIT: [MessageHandler(filters.Document.ALL, upload_receive)]},
         fallbacks=[CommandHandler("cancel", upload_cancel)],
-    )
-    application.add_handler(upload_conv)
-
-    terminal_conv = ConversationHandler(
+    ))
+    app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(terminal_start, pattern="^terminal$")],
         states={TERMINAL_SESSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, terminal_handle)]},
         fallbacks=[CommandHandler("cancel", terminal_cancel)],
-    )
-    application.add_handler(terminal_conv)
+    ))
 
-    application.add_error_handler(error_handler)
-
-    application.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
